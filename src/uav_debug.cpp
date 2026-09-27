@@ -1,4 +1,5 @@
 #include <chrono>
+#include <exception>
 #include <opencv2/opencv.hpp>
 #include <thread>
 
@@ -23,7 +24,7 @@ const std::string keys =
 
 using namespace std::chrono_literals;
 
-int main(int argc, char * argv[])
+int main(int argc, char * argv[]) try
 {
   cv::CommandLineParser cli(argc, argv, keys);
   auto config_path = cli.get<std::string>("@config-path");
@@ -55,7 +56,10 @@ int main(int argc, char * argv[])
 
   auto t0 = std::chrono::steady_clock::now();
 
+  std::exception_ptr failure;
+  try {
   while (!exiter.exit()) {
+    cboard.rethrow_if_failed();
     io::FramePacket frame;
     if (!camera.read_for(frame, std::chrono::milliseconds(50))) { cboard.send({}); continue; }
     img = frame.image;
@@ -177,5 +181,16 @@ int main(int argc, char * argv[])
     if (key == 'q') break;
   }
 
+  } catch (...) { failure = std::current_exception(); }
+  cboard.close_control();
+  try { cboard.rethrow_if_failed(); }
+  catch (...) { if (!failure) failure = std::current_exception(); }
+  if (failure) std::rethrow_exception(failure);
   return 0;
+} catch (const std::exception & error) {
+  tools::logger()->error("Runtime stopped: {}", error.what());
+  return 1;
+} catch (...) {
+  tools::logger()->error("Runtime stopped: unknown exception");
+  return 1;
 }

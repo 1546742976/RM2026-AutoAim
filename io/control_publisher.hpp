@@ -20,6 +20,7 @@ public:
   struct Status {
     std::exception_ptr failure;
     std::exception_ptr stop_failure;
+    bool closed = false;
     bool stop_attempted = false;
     bool stop_written = false;
   };
@@ -39,7 +40,9 @@ public:
   Status status() const
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    return status_;
+    auto result = status_;
+    result.closed = closed_;
+    return result;
   }
   void rethrow_if_failed() const
   {
@@ -89,6 +92,12 @@ private:
         dirty_ = false;
       }
       intent = filter_(intent);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // A close requested during filtering must not admit this cached command.
+        // A transport write already admitted here may finish before the final stop.
+        if (closed_) break;
+      }
       if (write_(intent) != WriteResult::complete)
         throw std::runtime_error("Control transport write incomplete");
       was_active = intent.command.control;

@@ -71,10 +71,14 @@ CBoardUART::CBoardUART(const std::string & config_path)
   publisher_ = std::make_unique<ControlPublisher>(
     [this](ControlIntent intent) {
       const auto result = control_guard_.evaluate(intent, mode.load() != Mode::idle);
-      control_diagnostics_.record("CBoardUART", result);
+      control_diagnostics_.observe(result);
       return result.intent;
     },
-    [this](const ControlIntent & intent) { return write_control(intent); });
+    [this](const ControlIntent & intent) {
+      const auto result = write_control(intent);
+      control_diagnostics_.report("CBoardUART");
+      return result;
+    });
   thread_ = std::thread(&CBoardUART::read_thread, this);
   tools::logger()->info("[CBoardUART] Opened.");
 }

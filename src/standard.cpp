@@ -1,6 +1,7 @@
 #include <fmt/core.h>
 
 #include <chrono>
+#include <exception>
 #include <nlohmann/json.hpp>
 #include <opencv2/opencv.hpp>
 
@@ -26,7 +27,7 @@ const std::string keys =
   "{help h usage ? |      | 输出命令行参数说明}"
   "{@config-path   | configs/standard3.yaml | 位置参数，yaml配置文件路径 }";
 
-int main(int argc, char * argv[])
+int main(int argc, char * argv[]) try
 {
   cv::CommandLineParser cli(argc, argv, keys);
   auto config_path = cli.get<std::string>(0);
@@ -56,7 +57,10 @@ int main(int argc, char * argv[])
   auto mode = io::GimbalMode::IDLE;
   auto last_mode = io::GimbalMode::IDLE;
 
+  std::exception_ptr failure;
+  try {
   while (!exiter.exit()) {
+    gimbal.rethrow_if_failed();
     io::FramePacket frame;
     if (!camera.read_for(frame, 50ms)) { gimbal.send(io::Command{}); continue; }
     img = frame.image;
@@ -96,5 +100,16 @@ int main(int argc, char * argv[])
     gimbal.send_imu_forward(dm_imu);
   }
 
+  } catch (...) { failure = std::current_exception(); }
+  gimbal.close_control();
+  try { gimbal.rethrow_if_failed(); }
+  catch (...) { if (!failure) failure = std::current_exception(); }
+  if (failure) std::rethrow_exception(failure);
   return 0;
+} catch (const std::exception & error) {
+  tools::logger()->error("Runtime stopped: {}", error.what());
+  return 1;
+} catch (...) {
+  tools::logger()->error("Runtime stopped: unknown exception");
+  return 1;
 }

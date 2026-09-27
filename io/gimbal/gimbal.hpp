@@ -105,6 +105,7 @@ public:
   // 裁判系统回调函数类型：参数依次为 cmd_id, 数据指针, 数据长度
   using RefereeCallback = std::function<void(uint16_t cmd_id, const uint8_t* data, uint16_t len)>;
   using NavRefereeCallback = std::function<void(uint16_t cmd_id, const std::vector<uint8_t>& data)>;
+  // Runs after successful control=true packets only, never for a stop packet.
   using AfterSendGimbalData = std::function<void(void)>;
 
   Gimbal(const std::string & config_path);
@@ -119,6 +120,7 @@ public:
   void observe_frame(std::chrono::steady_clock::time_point t, const Eigen::Quaterniond & q);
   void send(io::ControlIntent intent);
   void rethrow_if_failed() const { publisher_->rethrow_if_failed(); }
+  void close_control() noexcept { publisher_->close(); }
   ControlPublisher::Status control_status() const { return publisher_->status(); }
 
   void send(

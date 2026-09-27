@@ -15,10 +15,14 @@ CBoard::CBoard(const std::string & config_path)
   publisher_ = std::make_unique<ControlPublisher>(
     [this](ControlIntent intent) {
       const auto result = control_guard_.evaluate(intent, mode.load() != Mode::idle);
-      control_diagnostics_.record("CBoard", result);
+      control_diagnostics_.observe(result);
       return result.intent;
     },
-    [this](const ControlIntent & intent) { return write_control(intent); });
+    [this](const ControlIntent & intent) {
+      const auto result = write_control(intent);
+      control_diagnostics_.report("CBoard");
+      return result;
+    });
   tools::logger()->info("[Cboard] Opened.");
 }
 

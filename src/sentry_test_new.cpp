@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <exception>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <opencv2/opencv.hpp>
 #include <thread>
@@ -28,7 +30,7 @@ const std::string keys =
   "{help h usage ? |                        | 输出命令行参数说明}"
   "{@config-path   | configs/test2.yaml | 位置参数，yaml配置文件路径 }";
 
-int main(int argc, char * argv[])
+int main(int argc, char * argv[]) try
 {
   tools::Exiter exiter;
   tools::Plotter plotter;
@@ -55,17 +57,30 @@ int main(int argc, char * argv[])
   target_queue.push(std::nullopt);
 
   std::atomic<bool> quit = false;
+  std::mutex failure_mutex;
+  std::exception_ptr failure;
+  const auto fail = [&] {
+    {
+      std::lock_guard<std::mutex> lock(failure_mutex);
+      if (!failure) failure = std::current_exception();
+      quit = true;
+    }
+    gimbal.close_control();
+  };
   
   std::cout << "Waiting for devices..." << std::endl;
   std::this_thread::sleep_for(1s);
 
   auto plan_thread = std::thread([&]() {
+    try {
     auto t0 = std::chrono::steady_clock::now();
 
     std::optional<auto_aim::Target> target;
     while (!quit) {
+      gimbal.rethrow_if_failed();
       std::optional<auto_aim::Target> update;
       if (target_queue.pop_for(update, 10ms)) target = std::move(update);
+      if (quit) break;
       if (gimbal.mode() != io::GimbalMode::AUTO_AIM) target.reset();
       
       const auto feedback = gimbal.state();
@@ -112,13 +127,16 @@ int main(int argc, char * argv[])
 
       std::this_thread::sleep_for(10ms);
     }
+    } catch (...) { fail(); }
   });
 
   cv::Mat img;
   std::chrono::steady_clock::time_point t;
 
   auto previous_mode = gimbal.mode();
-  while (!exiter.exit()) {
+  try {
+  while (!quit && !exiter.exit()) {
+    gimbal.rethrow_if_failed();
     io::FramePacket frame;
     if (!camera.read_for(frame, 50ms)) { target_queue.push(std::nullopt); continue; }
     img = frame.image;
@@ -181,11 +199,20 @@ int main(int argc, char * argv[])
     if (key == 'q') break;
   }
 
+  } catch (...) { fail(); }
   quit = true;
+  gimbal.close_control();
   target_queue.close();
   if (plan_thread.joinable()) plan_thread.join();
   
-  gimbal.send(false, false, 0, 0, 0, 0, 0, 0);
+  try { gimbal.rethrow_if_failed(); } catch (...) { fail(); }
+  if (failure) std::rethrow_exception(failure);
 
   return 0;
+} catch (const std::exception & error) {
+  tools::logger()->error("Runtime stopped: {}", error.what());
+  return 1;
+} catch (...) {
+  tools::logger()->error("Runtime stopped: unknown exception");
+  return 1;
 }

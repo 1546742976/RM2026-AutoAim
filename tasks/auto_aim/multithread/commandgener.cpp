@@ -90,12 +90,24 @@ void CommandGener::request_stop() noexcept
 
 void CommandGener::clear()
 {
-  std::lock_guard<std::mutex> lock(mtx_);
-  if (stop_) return;
-  latest_.reset();
-  ++generation_;
-  send_({});
+  std::exception_ptr error;
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (stop_) return;
+    latest_.reset();
+    ++generation_;
+    try { send_({}); }
+    catch (...) {
+      error = std::current_exception();
+      if (!failure_) failure_ = error;
+      stop_ = true;
+    }
+  }
   cv_.notify_all();
+  if (error) {
+    request_stop();
+    std::rethrow_exception(error);
+  }
 }
 
 void CommandGener::push(

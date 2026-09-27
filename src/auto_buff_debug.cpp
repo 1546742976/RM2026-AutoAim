@@ -1,6 +1,7 @@
 ﻿#include <fmt/format.h>
 
 #include <string>
+#include <exception>
 
 #include "io/camera.hpp"
 #include "io/cboard.hpp"
@@ -22,7 +23,7 @@ const std::string keys =
   "{help h usage ? | | 输出命令行参数说明}"
   "{@config-path   | | yaml配置文件路径 }";
 
-int main(int argc, char * argv[])
+int main(int argc, char * argv[]) try
 {
   // 读取命令行参数
   cv::CommandLineParser cli(argc, argv, keys);
@@ -53,7 +54,10 @@ int main(int argc, char * argv[])
   std::chrono::steady_clock::time_point t;
 
   auto previous_mode = io::Mode::idle;
+  std::exception_ptr failure;
+  try {
   while (!exiter.exit()) {
+    cboard.rethrow_if_failed();
     io::FramePacket frame;
     if (!camera.read_for(frame, std::chrono::milliseconds(50))) { cboard.send({}); continue; }
     img = frame.image;
@@ -161,5 +165,16 @@ int main(int argc, char * argv[])
     if (key == 'q') break;
   }
 
+  } catch (...) { failure = std::current_exception(); }
+  cboard.close_control();
+  try { cboard.rethrow_if_failed(); }
+  catch (...) { if (!failure) failure = std::current_exception(); }
+  if (failure) std::rethrow_exception(failure);
   return 0;
+} catch (const std::exception & error) {
+  tools::logger()->error("Runtime stopped: {}", error.what());
+  return 1;
+} catch (...) {
+  tools::logger()->error("Runtime stopped: unknown exception");
+  return 1;
 }

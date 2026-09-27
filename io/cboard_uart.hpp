@@ -21,6 +21,7 @@ public:
     Eigen::Quaterniond imu_at(std::chrono::steady_clock::time_point timestamp);
     void send(Command command) const;
     void rethrow_if_failed() const { publisher_->rethrow_if_failed(); }
+    void close_control() noexcept { publisher_->close(); }
     ControlPublisher::Status control_status() const { return publisher_->status(); }
 
 private:

@@ -161,11 +161,10 @@ MPC 的规划参考误差不能替代实际云台误差。`runtime.hpp` 中没�
 
 它构造 `YOLO -> Tracker（包括 PnP）-> Planner`，不构造相机、云台、CBoard 或串口对象。`fire_requested` 只是 CSV 中的离线决策字段，不发送任何硬件命令。
 
-在 WSL、仓库根目录运行，先按本机安装路径加载 OpenVINO 环境：
+在 WSL、仓库根目录运行。本机使用系统安装的 OpenVINO CMake 包；以下命令复用现有构建缓存，不依赖已不存在的 `setupvars.sh`：
 
 ```bash
-source /opt/intel/openvino_2026/setupvars.sh
-cmake -S . -B build/codex-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+source /opt/ros/humble/setup.bash
 cmake --build build/codex-release --target auto_aim_replay -j2
 ./build/codex-release/auto_aim_replay records/sample \
   --config-path=configs/demo.yaml --output=build/replay.csv \
@@ -273,3 +272,49 @@ ctest --test-dir build/codex-release --output-on-failure
 - `ctest --test-dir build/codex-release -R '^runtime_contracts$' --output-on-failure`：**1/1 通过**，测试耗时 0.10 秒。
 
 本轮没有重跑识别/PnP/弹道测试，也没有进行实机或命中测试；上述结果仅证明本次停止联锁代码的构建与定向行为验证通过。
+
+## 11. 异常退出与发送失败收尾（2026-09-28）
+
+本节对应 `b5afddb` 之后的安全维护收尾。第 9、10 节的测试结果属于历史版本，不能作为当前代码的验证结果。
+
+### 故障生命周期
+
+- `ControlPublisher` 的写回调返回 `WriteResult::complete` 或 `failed`。UART 短写、CAN 写异常、Gimbal 写失败及过滤/发送回调异常均终止正常控制发送。
+- 首次故障被保存，缓存指令被丢弃，后续 `publish()` 被拒绝。发送线程至多再尝试一次停止写入；停止写入失败单独保存，不覆盖首次故障，不循环重试。
+- 过滤旧指令期间收到关闭请求时，过滤完成后的指令被丢弃；已经获准进入驱动的写操作允许返回，随后发送最终停止包。`status().closed` 表示已拒绝新提交，不表示设备已停止。
+- `close_control()` 是本次运行会话的终止操作：等待唯一控制发送线程退出，之后不能恢复发送。仅用于退出/故障，不用于普通模式切换。恢复需要重新建立运行会话，串口自行重连不解除发送故障。
+- `CommandGener` 在工作线程边界捕获异常，清空待处理输入并使在途结果失效，提交一次停止请求。`close()` 可重复调用；关闭后的 `push()` 不再接收任务。
+- 入口在等待图像之前检查工作线程和通信线程故障；退出时停止生产、终止控制发送并回收线程，再报告首次错误。无图像不会无限推迟故障检查。物理写入或设备驱动已阻塞时，主机不能保证立即完成关闭。
+
+`status().stop_attempted` 表示开始尝试停止写入；`stop_written` 仅表示主机完整写入，不是下位机确认。`CommandGener` 的停止提交成功也仅代表请求已交给发送端。日志使用 `device_stop=unverified`，不宣称设备已停止。
+
+### 联锁诊断
+
+`ControlGuard::evaluate()` 返回过滤结果和原因位，`apply()` 保留原调用接口。原因包括禁用、源时间缺失、旧模式、未来时间、控制/开火时效超限、姿态无效、未标定、两路反馈无效/过期、非有限数值和指令到期。原因位及来源元数据只在主机内部传递，不改变协议。
+
+提交阶段已撤销的许可不会因发送阶段条件恢复而重新获得。诊断在发送端计数，提交阶段不重复计数；计数表示评估次数，不表示独立故障次数。拒绝后的停止指令保留源帧号/时间供诊断使用，但控制量清零；停止包不纳入有效控制延迟统计。
+
+日志在控制包写入之后输出，不在联锁锁内或过滤与写入之间进行日志 I/O。原因变化时记录，持续相同原因每 5 秒最多汇总一次。Gimbal 的发送后附加回调只在 `control=true` 包成功写入后执行，停止包不调用该回调。导航和 IMU 转发使用独立接口，本节的发送失败锁存结论仅覆盖控制发布链路。
+
+### 部署记录与仍待设备核实的项目
+
+| 项目 | 需要的记录 | 当前证据 |
+| --- | --- | --- |
+| 时间标定 | 相机/姿态设备标识、配置版本、测量日期、接收时刻定义、偏移/抖动及测量方法 | 未提供；保持 `camera_timing_calibrated=false` |
+| 姿态约定 | 坐标系、轴方向、姿态来源、固件版本 | 按部署配置逐项核实，不能由代码编译通过代替 |
+| 独立停机 | 下位机固件版本、通信超时条件、主机进程停止/线路断开后的无弹观察记录 | 未验证；主机保护无法证明断电/冻结后的设备状态 |
+| NUC 性能 | i5-12450H 上真实采集到主机发送的延迟，以及使用的入口/配置 | 未验证；WSL 故障测试不产生实机 FPS 或延迟结论 |
+
+强侧视、斜轴、异高板身份、选靶及弹道相关能力继续作为未完成或未验收项登记。本次未实现提高自动射击命中能力的算法改动。
+
+### 本轮无硬件验证
+
+仅运行故障处理相关测试，并编译受影响入口。测试使用模拟回调，不构造相机、串口、CAN 或云台对象。运行命令（WSL Bash，仓库根目录）：
+
+```bash
+source /opt/ros/humble/setup.bash
+cmake --build build/codex-release -j2
+ctest --test-dir build/codex-release -R '^(runtime_contracts|command_worker_contracts)$' --output-on-failure
+```
+
+本轮结果：待本轮构建和测试完成后填写；不沿用上一轮通过记录。

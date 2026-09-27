@@ -1,6 +1,7 @@
 #include <fmt/core.h>
 
 #include <chrono>
+#include <exception>
 #include <nlohmann/json.hpp>
 #include <opencv2/opencv.hpp>
 #include <thread>
@@ -29,7 +30,7 @@ const std::string keys =
   "{help h usage ? |                        | 输出命令行参数说明}"
   "{@config-path   | configs/sentry.yaml | 位置参数，yaml配置文件路径 }";
 
-int main(int argc, char * argv[])
+int main(int argc, char * argv[]) try
 {
   tools::Exiter exiter;
   tools::Plotter plotter;
@@ -61,7 +62,10 @@ int main(int argc, char * argv[])
   io::Command last_command;
 
   auto previous_mode = cboard.mode.load();
+  std::exception_ptr failure;
+  try {
   while (!exiter.exit()) {
+    cboard.rethrow_if_failed();
     io::FramePacket frame;
     if (!camera.read_for(frame, std::chrono::milliseconds(50))) { cboard.send({}); continue; }
     img = frame.image;
@@ -110,5 +114,16 @@ int main(int argc, char * argv[])
 
     ros2.publish(target_info);
   }
+  } catch (...) { failure = std::current_exception(); }
+  cboard.close_control();
+  try { cboard.rethrow_if_failed(); }
+  catch (...) { if (!failure) failure = std::current_exception(); }
+  if (failure) std::rethrow_exception(failure);
   return 0;
+} catch (const std::exception & error) {
+  tools::logger()->error("Runtime stopped: {}", error.what());
+  return 1;
+} catch (...) {
+  tools::logger()->error("Runtime stopped: unknown exception");
+  return 1;
 }

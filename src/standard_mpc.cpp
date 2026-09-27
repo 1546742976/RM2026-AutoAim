@@ -27,7 +27,7 @@ struct PlanningInput {
 };
 }
 
-int main(int argc, char * argv[])
+int main(int argc, char * argv[]) try
 {
   cv::CommandLineParser cli(argc, argv,
     "{help h||}{@config-path|configs/standard3.yaml|yaml configuration}");
@@ -51,19 +51,25 @@ int main(int argc, char * argv[])
   std::mutex failure_mutex;
   std::exception_ptr failure;
   const auto fail = [&] {
-    std::lock_guard<std::mutex> lock(failure_mutex);
-    if (!failure) failure = std::current_exception();
-    quit = true;
+    {
+      std::lock_guard<std::mutex> lock(failure_mutex);
+      if (!failure) failure = std::current_exception();
+      quit = true;
+    }
+    gimbal.close_control();
   };
   std::thread planning([&] {
     try {
     PlanningInput input;
     auto next_plan = std::chrono::steady_clock::now();
     while (!quit) {
+      gimbal.rethrow_if_failed();
       PlanningInput update;
       if (pending.pop_for(update, 10ms)) input = std::move(update);
       if (quit) break;
       std::this_thread::sleep_until(next_plan);
+      if (quit) break;
+      gimbal.rethrow_if_failed();
       // Drain at the deadline: do not plan an input replaced during the wait.
       while (pending.try_pop(update)) input = std::move(update);
       const auto mode = gimbal.mode();
@@ -79,12 +85,12 @@ int main(int argc, char * argv[])
       next_plan = std::chrono::steady_clock::now() + 10ms;
     }
     } catch (...) { fail(); }
-    gimbal.send(io::Command{});
   });
 
   auto previous_mode = io::GimbalMode::IDLE;
   try {
   while (!quit && !exiter.exit()) {
+    gimbal.rethrow_if_failed();
     const auto mode = gimbal.mode();
     if (mode != previous_mode) {
       tracker.reset();
@@ -134,9 +140,16 @@ int main(int argc, char * argv[])
   }
   } catch (...) { fail(); }
   quit = true;
+  gimbal.close_control();
   pending.close();
   planning.join();
-  gimbal.send(io::Command{});
+  try { gimbal.rethrow_if_failed(); } catch (...) { fail(); }
   if (failure) std::rethrow_exception(failure);
   return 0;
+} catch (const std::exception & error) {
+  tools::logger()->error("Runtime stopped: {}", error.what());
+  return 1;
+} catch (...) {
+  tools::logger()->error("Runtime stopped: unknown exception");
+  return 1;
 }

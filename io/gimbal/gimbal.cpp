@@ -40,10 +40,14 @@ Gimbal::Gimbal(const std::string & config_path, AfterSendGimbalData after_send_g
   publisher_ = std::make_unique<ControlPublisher>(
     [this](ControlIntent intent) {
       const auto result = control_guard_.evaluate(intent, mode() != GimbalMode::IDLE);
-      control_diagnostics_.record("Gimbal", result);
+      control_diagnostics_.observe(result);
       return result.intent;
     },
-    [this](const ControlIntent & intent) { return write_control(intent); });
+    [this](const ControlIntent & intent) {
+      const auto result = write_control(intent);
+      control_diagnostics_.report("Gimbal");
+      return result;
+    });
   thread_ = std::thread(&Gimbal::read_thread, this);
 
   tools::logger()->info("[Gimbal] Waiting for timestamped poses in the receive thread.");

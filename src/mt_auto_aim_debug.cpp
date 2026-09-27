@@ -16,12 +16,13 @@
 #include "tasks/auto_aim/tracker.hpp"
 #include "tools/exiter.hpp"
 #include "tools/img_tools.hpp"
+#include "tools/logger.hpp"
 #include "tools/math_tools.hpp"
 #include "tools/plotter.hpp"
 
 using namespace std::chrono_literals;
 
-int main(int argc, char * argv[])
+int main(int argc, char * argv[]) try
 {
   cv::CommandLineParser cli(argc, argv,
     "{help h usage ? | | 输出命令行参数说明}"
@@ -44,13 +45,18 @@ int main(int argc, char * argv[])
   std::mutex error_mutex;
   std::exception_ptr failure;
   const auto remember_failure = [&] {
-    std::lock_guard<std::mutex> lock(error_mutex);
-    if (!failure) failure = std::current_exception();
-    stopping = true;
+    {
+      std::lock_guard<std::mutex> lock(error_mutex);
+      if (!failure) failure = std::current_exception();
+      stopping = true;
+    }
+    cboard.close_control();
   };
   std::thread capture([&] {
     try {
       while (!stopping && !exiter.exit()) {
+        cboard.rethrow_if_failed();
+        commands.rethrow_if_failed();
         io::FramePacket frame;
         if (!camera.read_for(frame, 50ms)) continue;
         const auto mode = cboard.mode.load();
@@ -64,6 +70,8 @@ int main(int argc, char * argv[])
   auto mode_since = std::chrono::steady_clock::now();
   try {
     while (!stopping && !exiter.exit()) {
+      cboard.rethrow_if_failed();
+      commands.rethrow_if_failed();
       const auto mode = cboard.mode.load();
       if (mode != previous_mode) {
         previous_mode = mode;
@@ -113,9 +121,24 @@ int main(int argc, char * argv[])
     }
   } catch (...) { remember_failure(); }
   stopping = true;
-  commands.clear();
+  cboard.close_control();
+  commands.close();
   detector.close();
   capture.join();
+  try { commands.rethrow_if_failed(); } catch (...) { remember_failure(); }
+  try { cboard.rethrow_if_failed(); } catch (...) { remember_failure(); }
+  if (const auto stop_failure = commands.stop_failure()) {
+    try { std::rethrow_exception(stop_failure); }
+    catch (const std::exception & error) {
+      tools::logger()->error("Command worker stop request failed: {}", error.what());
+    } catch (...) { tools::logger()->error("Command worker stop request failed: unknown exception"); }
+  }
   if (failure) std::rethrow_exception(failure);
   return 0;
+} catch (const std::exception & error) {
+  tools::logger()->error("Runtime stopped: {}", error.what());
+  return 1;
+} catch (...) {
+  tools::logger()->error("Runtime stopped: unknown exception");
+  return 1;
 }

@@ -1,10 +1,12 @@
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include "io/control_guard.hpp"
 #include "io/control_publisher.hpp"
@@ -22,8 +24,229 @@ static void require_tracking_only(const io::ControlIntent & intent, const char *
   require(intent.command.control && !intent.command.shoot, message);
 }
 
+static std::string exception_message(std::exception_ptr failure)
+{
+  if (!failure) return {};
+  try { std::rethrow_exception(failure); }
+  catch (const std::exception & error) { return error.what(); }
+  catch (...) { return "non-standard exception"; }
+}
+
+static void test_guard_diagnostics()
+{
+  using Guard = io::ControlGuard;
+  using Clock = Guard::Clock;
+  const auto t = Clock::time_point{} + 1s;
+  Guard guard;
+  guard.configure(30, 60, true);
+  guard.observe(t, true);
+  guard.observe_feedback(t, true, 1.0);
+  io::ControlIntent command{{true, false, 0.1, 0.2}};
+  command.command.source_time = t;
+  command.command.frame_id = 42;
+  const auto fresh = guard.evaluate(command, true, t);
+  require(fresh.reasons == 0 && fresh.intent.command.control && !fresh.intent.command.shoot,
+          "diagnostic evaluation escalated an existing non-shoot request");
+
+  auto missing = command;
+  missing.command.source_time = {};
+  const auto missing_result = guard.evaluate(missing, true, t);
+  require((missing_result.reasons & Guard::missing_source) != 0,
+          "missing source was not diagnosed");
+  require_tracking_only(missing_result.intent, "missing source escalated during evaluation");
+
+  guard.configure(30, 60, false);
+  const auto combined = guard.evaluate(missing, true, t);
+  require((combined.reasons & (Guard::missing_source | Guard::uncalibrated)) ==
+            (Guard::missing_source | Guard::uncalibrated),
+          "simultaneous rejection reasons were lost");
+  guard.configure(30, 60, true);
+  const auto repeated = guard.evaluate(combined.intent, true, t);
+  require((repeated.reasons & combined.reasons) == combined.reasons &&
+            !repeated.intent.command.shoot,
+          "second evaluation lost submission reasons or restored shoot");
+
+  const auto stopped = guard.evaluate(command, false, t);
+  require((stopped.reasons & Guard::disabled) != 0 && !stopped.intent.command.control &&
+            !stopped.intent.command.shoot && stopped.intent.command.yaw == 0 &&
+            stopped.intent.command.source_time == t && stopped.intent.command.frame_id == 42 &&
+            stopped.intent.inhibit_reasons == stopped.reasons,
+          "stop diagnostics lost provenance or retained an active command");
+  auto future = command;
+  future.command.source_time = t + 1ms;
+  const auto future_result = guard.evaluate(future, true, t);
+  require((future_result.reasons & Guard::future_time) != 0 &&
+            !future_result.intent.command.control, "future source was not stopped/diagnosed");
+  const auto old = guard.evaluate(command, true, t + 61ms);
+  require((old.reasons & (Guard::control_expired | Guard::shoot_expired |
+                         Guard::pose_feedback_stale | Guard::status_feedback_stale)) ==
+            (Guard::control_expired | Guard::shoot_expired |
+             Guard::pose_feedback_stale | Guard::status_feedback_stale) &&
+            !old.intent.command.control, "expired command reasons incomplete");
+
+  auto bad_pose = command;
+  bad_pose.command.pose_valid = false;
+  const auto pose_result = guard.evaluate(bad_pose, true, t);
+  require((pose_result.reasons & Guard::pose_invalid) != 0 &&
+            !pose_result.intent.command.control, "invalid pose was not stopped/diagnosed");
+  auto deadline = command;
+  deadline.command.valid_until = t - 1ms;
+  const auto deadline_result = guard.evaluate(deadline, true, t);
+  require((deadline_result.reasons & Guard::deadline_expired) != 0 &&
+            !deadline_result.intent.command.control && deadline_result.intent.command.frame_id == 42,
+          "expired explicit deadline was not stopped/diagnosed");
+
+  for (int field = 0; field < 7; ++field) {
+    auto bad_number = command;
+    double * values[] = {&bad_number.command.yaw, &bad_number.command.pitch,
+      &bad_number.command.horizon_distance, &bad_number.yaw_vel, &bad_number.yaw_acc,
+      &bad_number.pitch_vel, &bad_number.pitch_acc};
+    *values[field] = std::numeric_limits<double>::quiet_NaN();
+    const auto result = guard.evaluate(bad_number, true, t);
+    require((result.reasons & Guard::nonfinite) != 0 && !result.intent.command.control &&
+              result.intent.command.frame_id == 42 && result.intent.command.source_time == t,
+            "nonfinite value escaped stop or lost diagnostic provenance");
+  }
+  guard.observe_feedback(t, false, 0.0);
+  const auto bad_feedback = guard.evaluate(command, true, t);
+  require((bad_feedback.reasons & (Guard::pose_feedback_invalid | Guard::status_feedback_invalid)) ==
+            (Guard::pose_feedback_invalid | Guard::status_feedback_invalid),
+          "invalid feedback reasons incomplete");
+  guard.invalidate(t + 1ms);
+  guard.observe(t + 2ms, true);
+  const auto previous = guard.evaluate(command, true, t + 2ms);
+  require((previous.reasons & Guard::previous_mode) != 0 && !previous.intent.command.control,
+          "previous-mode result was not stopped/diagnosed");
+}
+
+enum class InjectedFailure { filter, incomplete_write, throwing_write };
+enum class StopOutcome { complete, incomplete, throws };
+
+static void test_publisher_failure(InjectedFailure failure, StopOutcome stop_outcome)
+{
+  using Publisher = io::ControlPublisher;
+  std::mutex mutex;
+  std::condition_variable changed;
+  int normal_writes = 0, stop_writes = 0;
+  Publisher publisher(
+    [&](io::ControlIntent intent) {
+      if (failure == InjectedFailure::filter) throw std::runtime_error("filter failed");
+      return intent;
+    },
+    [&](const io::ControlIntent & intent) {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!intent.command.control) {
+        ++stop_writes;
+        changed.notify_one();
+        if (stop_outcome == StopOutcome::throws) throw std::runtime_error("stop failed");
+        return stop_outcome == StopOutcome::complete ? Publisher::WriteResult::complete :
+          Publisher::WriteResult::failed;
+      }
+      ++normal_writes;
+      if (failure == InjectedFailure::throwing_write) throw std::runtime_error("write failed");
+      // A short write is reported by the transport as the same failed result.
+      return Publisher::WriteResult::failed;
+    });
+  io::ControlIntent command{{true, false, 0.1, 0.2}};
+  publisher.publish(command);
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    require(changed.wait_for(lock, 2s, [&] { return stop_writes != 0; }),
+            "publisher failure did not attempt a stop");
+  }
+  require(publisher.status().failure != nullptr, "publisher did not latch original fault");
+  publisher.publish(command);
+  publisher.close();
+  publisher.close();
+  const auto status = publisher.status();
+  require(status.stop_attempted && status.stop_written == (stop_outcome == StopOutcome::complete) &&
+            bool(status.stop_failure) == (stop_outcome != StopOutcome::complete),
+          "stop outcome was recorded incorrectly");
+  const std::string expected = failure == InjectedFailure::filter ? "filter failed" :
+    failure == InjectedFailure::throwing_write ? "write failed" :
+    "Control transport write incomplete";
+  require(exception_message(status.failure) == expected,
+          "stop failure replaced the original publisher fault");
+  if (stop_outcome != StopOutcome::complete)
+    require(exception_message(status.stop_failure) ==
+              (stop_outcome == StopOutcome::throws ? "stop failed" :
+               "Control transport stop write incomplete"),
+            "stop error was not retained independently");
+  bool rethrown = false;
+  try { publisher.rethrow_if_failed(); }
+  catch (const std::runtime_error & error) { rethrown = error.what() == expected; }
+  require(rethrown, "owner could not retrieve original publisher failure");
+  require(normal_writes == (failure == InjectedFailure::filter ? 0 : 1) && stop_writes == 1,
+          "fault or repeated close resent a command/stop");
+}
+
+static void test_publisher_close_during_filter()
+{
+  using Publisher = io::ControlPublisher;
+  std::promise<void> entered, release;
+  auto entered_future = entered.get_future();
+  const auto release_future = release.get_future().share();
+  std::atomic<int> active_writes{0}, stops{0};
+  Publisher publisher(
+    [&](io::ControlIntent intent) {
+      entered.set_value();
+      require(release_future.wait_for(2s) == std::future_status::ready,
+              "test did not release blocked filter");
+      return intent;
+    },
+    [&](const io::ControlIntent & intent) {
+      if (intent.command.control) ++active_writes;
+      else ++stops;
+      return Publisher::WriteResult::complete;
+    });
+  publisher.publish(io::ControlIntent{{true, false, 0.1, 0.2}});
+  require(entered_future.wait_for(2s) == std::future_status::ready,
+          "publisher filter did not enter");
+  auto closing = std::async(std::launch::async, [&] { publisher.close(); });
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!publisher.status().closed && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  const bool closed_before_release = publisher.status().closed;
+  release.set_value();
+  require(closing.wait_for(2s) == std::future_status::ready,
+          "close did not finish after filter release");
+  closing.get();
+  require(closed_before_release && active_writes == 0 && stops == 1,
+          "close admitted an active command still inside the filter");
+  require(!publisher.status().failure && publisher.status().stop_written,
+          "normal close during filtering was reported as failure");
+}
+
+static void test_publisher_close_stop_failure()
+{
+  using Publisher = io::ControlPublisher;
+  int stops = 0;
+  Publisher publisher(
+    [](io::ControlIntent intent) { return intent; },
+    [&](const io::ControlIntent & intent) {
+      require(!intent.command.control && !intent.command.shoot,
+              "idle shutdown attempted active control");
+      ++stops;
+      return Publisher::WriteResult::failed;
+    });
+  publisher.close();
+  publisher.close();
+  const auto status = publisher.status();
+  require(stops == 1 && status.failure && status.stop_failure && !status.stop_written &&
+            exception_message(status.failure) == exception_message(status.stop_failure),
+          "close-only stop failure was lost or retried");
+}
+
 int main()
 {
+  test_guard_diagnostics();
+  for (const auto failure : {InjectedFailure::filter, InjectedFailure::incomplete_write,
+                             InjectedFailure::throwing_write}) {
+    for (const auto outcome : {StopOutcome::complete, StopOutcome::incomplete, StopOutcome::throws})
+      test_publisher_failure(failure, outcome);
+  }
+  test_publisher_close_during_filter();
+  test_publisher_close_stop_failure();
   using Clock = std::chrono::steady_clock;
   const auto t = Clock::time_point{} + 1s;
   tools::PoseHistory history;
@@ -175,22 +398,39 @@ int main()
                           "mode recovery escalated a non-shoot command");
   }
 
-  std::atomic<bool> active{false};
-  std::atomic<int> writes{0};
+  std::mutex expiry_mutex;
+  std::condition_variable expiry_changed;
+  bool active = false;
+  int writes = 0;
   io::ControlGuard live_guard;
   live_guard.configure(15, 30, true);
-  const auto live_time = Clock::now();
+  const auto live_time = t;
   live_guard.observe(live_time, true);
   live_guard.observe_pose_feedback(live_time, true);
   live_guard.observe_status_feedback(live_time, 1.0);
   {
     io::ControlPublisher publisher(
-      [&](io::ControlIntent intent) { return live_guard.apply(intent, true); },
-      [&](const io::ControlIntent & intent) { active = intent.command.control; ++writes; });
+      [&](io::ControlIntent intent) {
+        std::lock_guard<std::mutex> lock(expiry_mutex);
+        return live_guard.apply(intent, true, writes == 0 ? live_time : live_time + 31ms);
+      },
+      [&](const io::ControlIntent & intent) {
+        std::lock_guard<std::mutex> lock(expiry_mutex);
+        active = intent.command.control;
+        ++writes;
+        expiry_changed.notify_one();
+        return io::ControlPublisher::WriteResult::complete;
+      });
     command.command.source_time = live_time;
     publisher.publish(command);
-    std::this_thread::sleep_for(80ms);
+    std::unique_lock<std::mutex> lock(expiry_mutex);
+    require(expiry_changed.wait_for(lock, 2s, [&] { return writes > 1; }),
+            "publisher did not recheck a stored command");
     require(writes > 1 && !active, "stalled producer left active command latched");
+    lock.unlock();
+    publisher.close();
+    require(publisher.status().stop_written && !publisher.status().failure,
+            "normal publisher close did not record a successful stop write");
   }
   require(!active, "shutdown did not stop controller");
 
@@ -215,6 +455,7 @@ int main()
         // Invalidate after the repeated write, before the next filtering pass.
         if (emitted_count == 2) transmit_guard.observe_status_feedback(Clock::now(), 0.0);
         emitted_changed.notify_one();
+        return io::ControlPublisher::WriteResult::complete;
       });
     auto stored_command = command;
     stored_command.command.source_time = source_time;

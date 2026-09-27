@@ -13,11 +13,21 @@ namespace io
 class ControlDiagnostics
 {
 public:
-  void record(const char * transport, const ControlGuard::Evaluation & result)
+  void observe(const ControlGuard::Evaluation & result)
   {
+    latest_ = result;
+    pending_ = true;
     ++evaluations_;
     for (std::size_t i = 0; i < counts_.size(); ++i)
       if (result.reasons & (1u << i)) ++counts_[i];
+  }
+
+  // Write the control packet before any potentially blocking log I/O.
+  void report(const char * transport)
+  {
+    if (!pending_) return;
+    pending_ = false;
+    const auto & result = latest_;
     const auto now = ControlGuard::Clock::now();
     if (seen_ && previous_ == result.reasons && now - last_log_ < std::chrono::seconds(5)) return;
     // Active, uninhibited steady state needs no periodic log.
@@ -49,6 +59,8 @@ private:
   uint64_t evaluations_ = 0;
   uint32_t previous_ = 0;
   bool seen_ = false;
+  bool pending_ = false;
+  ControlGuard::Evaluation latest_{};
   ControlGuard::Clock::time_point last_log_{};
 };
 
