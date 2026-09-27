@@ -22,6 +22,7 @@ public:
     tools::Plotter & plotter, bool debug = false);
 
   ~CommandGener();
+  void clear();
 
   void push(
     const std::list<auto_aim::Target> & targets, const std::chrono::steady_clock::time_point & t,
@@ -47,6 +48,7 @@ private:
   std::condition_variable cv_;
   std::thread thread_;
   bool stop_, debug_;
+  uint64_t generation_ = 0;
 
   void generate_command();
 };

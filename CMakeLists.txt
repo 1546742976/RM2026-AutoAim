@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16.3)
 
 project(sp_vision)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 17)
 # set(CMAKE_BUILD_TYPE Debug)
 # set(CMAKE_BUILD_TYPE Release)
@@ -13,9 +15,8 @@ find_package(Eigen3 REQUIRED)
 find_package(spdlog REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(nlohmann_json REQUIRED)
-set(OpenVINO_DIR "/opt/intel/openvino_2024.6.0/runtime/cmake/")
+# Honor an explicitly selected SDK and the OpenVINO environment setup script.
 find_package(OpenVINO REQUIRED)
-set(FASTCDR_DIR "/opt/ros/humble/lib/cmake/fastcdr/")
 find_package(fastcdr QUIET)
 
 
@@ -31,6 +32,34 @@ add_subdirectory(io)
 add_subdirectory(tasks/auto_aim)
 add_subdirectory(tasks/auto_buff)
 add_subdirectory(tasks/omniperception)
+
+if(BUILD_TESTING)
+    add_executable(runtime_contract_test tests/runtime_contract_test.cpp)
+    target_link_libraries(runtime_contract_test PRIVATE Eigen3::Eigen Threads::Threads)
+    add_test(NAME runtime_contracts COMMAND runtime_contract_test)
+    add_executable(queue_contract_test tests/queue_contract_test.cpp)
+    target_link_libraries(queue_contract_test PRIVATE Threads::Threads)
+    add_test(NAME queue_contracts COMMAND queue_contract_test)
+    add_executable(pose_contract_test tests/pose_contract_test.cpp)
+    target_link_libraries(pose_contract_test PRIVATE auto_aim tools ${OpenCV_LIBS} yaml-cpp fmt::fmt)
+    add_test(NAME pose_contracts COMMAND pose_contract_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/pose.yaml)
+    add_executable(estimation_contract_test tests/estimation_contract_test.cpp)
+    target_link_libraries(estimation_contract_test PRIVATE auto_aim tools ${OpenCV_LIBS} yaml-cpp fmt::fmt)
+    add_test(NAME estimation_contracts COMMAND estimation_contract_test ${CMAKE_CURRENT_SOURCE_DIR}/configs/standard3.yaml)
+    add_executable(auto_aim_replay tests/auto_aim_replay.cpp)
+    target_link_libraries(auto_aim_replay PRIVATE auto_aim tools ${OpenCV_LIBS} yaml-cpp fmt::fmt)
+    add_executable(inference_contract_test tests/inference_contract_test.cpp)
+    target_link_libraries(inference_contract_test PRIVATE auto_aim tools ${OpenCV_LIBS} yaml-cpp fmt::fmt)
+    add_test(NAME inference_contracts COMMAND inference_contract_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/configs/standard3.yaml ${CMAKE_CURRENT_BINARY_DIR}/synthetic-replay)
+    set_tests_properties(inference_contracts PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} FIXTURES_SETUP replay_fixture TIMEOUT 120)
+    add_test(NAME replay_smoke COMMAND auto_aim_replay ${CMAKE_CURRENT_BINARY_DIR}/synthetic-replay
+        --config-path=${CMAKE_CURRENT_BINARY_DIR}/synthetic-replay.yaml
+        --output=${CMAKE_CURRENT_BINARY_DIR}/synthetic-replay.csv --warmup=2 --decision-delay-ms=30)
+    set_tests_properties(replay_smoke PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} FIXTURES_REQUIRED replay_fixture TIMEOUT 120)
+endif()
 
 ####################src###################
 add_executable(standard src/standard.cpp)

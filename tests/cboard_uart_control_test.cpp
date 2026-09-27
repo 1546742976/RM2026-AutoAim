@@ -155,7 +155,7 @@ int main(int argc, char * argv[])
     json["yaw_ref_deg"] = yaw_ref_pos;
     json["pitch_ref_deg"] = pitch_ref_pos;
     json["send_shoot"] = command.shoot ? 1 : 0;
-    json["bullet_speed"] = cboard.bullet_speed;
+    json["bullet_speed"] = cboard.bullet_speed.load();
     plotter.plot(json);
 
     // Send command via CBoardUART

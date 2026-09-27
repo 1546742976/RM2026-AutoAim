@@ -1,6 +1,8 @@
 #include "target.hpp"
 
 #include <numeric>
+#include <algorithm>
+#include <cmath>
 
 #include "tools/logger.hpp"
 #include "tools/math_tools.hpp"
@@ -47,6 +49,12 @@ Target::Target(
   };
 
   ekf_ = tools::ExtendedKalmanFilter(x0, P0, x_add);  //初始化滤波器（预测量、预测量协方差）
+  ekf_.nis_gate = 18.466827;  // 4 DoF, 99.9%; diagnostic remains 95%.
+  last_observation_time_ = t;
+  observed_xyz_ = armor.xyz_in_world;
+  observed_normal_ = armor.R_armor_to_world.col(0);
+  pose_reliable_ = armor.pose_valid && armor.pose_reliable;
+  geometry_reliable_ = std::abs(armor.ypr_in_world[2]) < 10 * CV_PI / 180;
 }
 
 Target::Target(double x, double vyaw, double radius, double h) : armor_num_(4)
@@ -63,17 +71,27 @@ Target::Target(double x, double vyaw, double radius, double h) : armor_num_(4)
   };
 
   ekf_ = tools::ExtendedKalmanFilter(x0, P0, x_add);  //初始化滤波器（预测量、预测量协方差）
+  name = ArmorName::three;
+  jumped = true;
+  // Synthetic target constructor is for offline trajectory/control tests.
+  pose_reliable_ = true;
+  is_converged_ = true;
+  update_count_ = 20;
+  acceleration_variance_ = 0;
 }
 
 void Target::predict(std::chrono::steady_clock::time_point t)
 {
   auto dt = tools::delta_time(t, t_);
+  if (dt < 0) return;
   predict(dt);
   t_ = t;
 }
 
 void Target::predict(double dt)
 {
+  if (!std::isfinite(dt) || dt < 0 || ekf_.x.size() != 11) return;
+  prediction_horizon_ += dt;
   // 状态转移矩阵
   // clang-format off
   Eigen::MatrixXd F{
@@ -101,6 +119,7 @@ void Target::predict(double dt)
     v1 = 100;  // 加速度方差
     v2 = 400;  // 角加速度方差
   }
+  v2 *= 1 + std::min(rejected_updates_, 4);
   auto a = dt * dt * dt * dt / 4;
   auto b = dt * dt * dt / 2;
   auto c = dt * dt;
@@ -124,21 +143,40 @@ void Target::predict(double dt)
   // 防止夹角求和出现异常值
   auto f = [&](const Eigen::VectorXd & x) -> Eigen::VectorXd {
     Eigen::VectorXd x_prior = F * x;
+    x_prior[6] += 0.5 * angular_acceleration_ * dt * dt;
+    x_prior[7] += angular_acceleration_ * dt;
     x_prior[6] = tools::limit_rad(x_prior[6]);
     return x_prior;
   };
 
-  // 前哨站转速特判
-  if (this->convergened() && this->name == ArmorName::outpost && std::abs(this->ekf_.x[7]) > 2)
-    this->ekf_.x[7] = this->ekf_.x[7] > 0 ? 2.51 : -2.51;
-
   ekf_.predict(F, Q, f);
+  mean_prediction_horizon_ = 0;
+}
+
+void Target::predict_mean(double dt)
+{
+  if (!std::isfinite(dt) || ekf_.x.size() != 11) return;
+  for (int i : {0, 2, 4}) ekf_.x[i] += dt * ekf_.x[i + 1];
+  ekf_.x[6] = tools::limit_rad(ekf_.x[6] + dt * ekf_.x[7] + 0.5 * angular_acceleration_ * dt * dt);
+  ekf_.x[7] += angular_acceleration_ * dt;
+  prediction_horizon_ += dt;
+  mean_prediction_horizon_ += dt;
+}
+
+void Target::predict_mean(std::chrono::steady_clock::time_point t)
+{
+  predict_mean(tools::delta_time(t, t_));
+  t_ = t;
 }
 
 void Target::update(const Armor & armor)
 {
+  last_update_accepted_ = false;
+  if (!armor.pose_valid || !armor.xyz_in_world.allFinite() || !armor.ypr_in_world.allFinite() ||
+      !armor.ypd_in_world.allFinite() || armor_num_ <= 0) return;
+  if (!geometry_reliable_) { update_visible_board(armor); return; }
   // 装甲板匹配
-  int id;
+  int id = 0;
   auto min_angle_error = 1e10;
   const std::vector<Eigen::Vector4d> & xyza_list = armor_xyza_list();
 
@@ -156,7 +194,7 @@ void Target::update(const Armor & armor)
     });
 
   // 取前3个distance最小的装甲板
-  for (int i = 0; i < 3; i++) {
+  for (size_t i = 0; i < std::min<size_t>(3, xyza_i_list.size()); i++) {
     const auto & xyza = xyza_i_list[i].first;
     Eigen::Vector3d ypd = tools::xyz2ypd(xyza.head(3));
     auto angle_error = std::abs(tools::limit_rad(armor.ypr_in_world[0] - xyza[3])) +
@@ -168,6 +206,36 @@ void Target::update(const Armor & armor)
     }
   }
 
+  const double previous_omega = last_observed_omega_;
+  const double observation_dt = tools::delta_time(t_, last_observation_time_);
+  update_ypda(armor, id);
+  last_update_accepted_ = ekf_.last_update_accepted;
+  if (!last_update_accepted_) {
+    ++rejected_updates_;
+    pose_reliable_ = false;
+    if (rejected_updates_ >= 3) {
+      geometry_reliable_ = false;
+      update_visible_board(armor);
+    }
+    return;
+  }
+  rejected_updates_ = 0;
+  last_observed_omega_ = ekf_.x[7];
+  if (observation_dt > 1e-4 && observation_dt < 0.2) {
+    const double sample = std::clamp((ekf_.x[7] - previous_omega) / observation_dt, -100.0, 100.0);
+    const double gain = 1 - std::exp(-observation_dt / 0.08);
+    const double error = sample - angular_acceleration_;
+    angular_acceleration_ = std::clamp(angular_acceleration_ + gain * error, -100.0, 100.0);
+    acceleration_variance_ = std::clamp((1 - gain) * acceleration_variance_ + gain * error * error, 1.0, 10000.0);
+  }
+  observed_xyz_ = armor.xyz_in_world;
+  observed_normal_ = armor.R_armor_to_world.col(0);
+  last_observation_time_ = t_;
+  prediction_horizon_ = 0;
+  mean_prediction_horizon_ = 0;
+  pose_reliable_ = armor.pose_reliable;
+  if (!geometry_ && std::abs(armor.ypr_in_world[2]) >= 10 * CV_PI / 180)
+    geometry_reliable_ = false;
   if (id != 0) jumped = true;
 
   if (id != last_id) {
@@ -181,7 +249,25 @@ void Target::update(const Armor & armor)
   last_id = id;
   update_count_++;
 
-  update_ypda(armor, id);
+}
+
+void Target::update_visible_board(const Armor & armor)
+{
+  const double dt = tools::delta_time(t_, last_observation_time_);
+  const Eigen::Vector3d displacement = armor.xyz_in_world - observed_xyz_;
+  if (dt > 1e-4 && dt < 0.2 && displacement.norm() < 0.3) {
+    const Eigen::Vector3d sample = displacement / dt;
+    visible_board_velocity_ = sample.norm() < 10 ?
+      (0.7 * visible_board_velocity_ + 0.3 * sample).eval() : Eigen::Vector3d::Zero();
+  } else {
+    visible_board_velocity_.setZero();
+  }
+  observed_xyz_ = armor.xyz_in_world;
+  observed_normal_ = armor.R_armor_to_world.col(0);
+  last_observation_time_ = t_;
+  prediction_horizon_ = mean_prediction_horizon_ = 0;
+  pose_reliable_ = armor.pose_reliable;
+  last_update_accepted_ = true;
 }
 
 void Target::update_ypda(const Armor & armor, int id)
@@ -194,6 +280,8 @@ void Target::update_ypda(const Armor & armor, int id)
   Eigen::VectorXd R_dig{
     {4e-3, 4e-3, log(std::abs(delta_angle) + 1) + 1,
      log(std::abs(armor.ypd_in_world[2]) + 1) / 200 + 9e-2}};
+  const double quality_scale = armor.pose_reliable ? 1.0 : 10.0;
+  R_dig *= quality_scale * (1 + std::min(25.0, armor.reprojection_error * armor.reprojection_error) / 4);
 
   //测量过程噪声偏差的方差
   Eigen::MatrixXd R = R_dig.asDiagonal();
@@ -202,7 +290,7 @@ void Target::update_ypda(const Armor & armor, int id)
   auto h = [&](const Eigen::VectorXd & x) -> Eigen::Vector4d {
     Eigen::VectorXd xyz = h_armor_xyz(x, id);
     Eigen::VectorXd ypd = tools::xyz2ypd(xyz);
-    auto angle = tools::limit_rad(x[6] + id * 2 * CV_PI / armor_num_);
+    auto angle = armor_yaw(x, id);
     return {ypd[0], ypd[1], ypd[2], angle};
   };
 
@@ -231,7 +319,7 @@ std::vector<Eigen::Vector4d> Target::armor_xyza_list() const
   std::vector<Eigen::Vector4d> _armor_xyza_list;
 
   for (int i = 0; i < armor_num_; i++) {
-    auto angle = tools::limit_rad(ekf_.x[6] + i * 2 * CV_PI / armor_num_);
+    auto angle = armor_yaw(ekf_.x, i);
     Eigen::Vector3d xyz = h_armor_xyz(ekf_.x, i);
     _armor_xyza_list.push_back({xyz[0], xyz[1], xyz[2], angle});
   }
@@ -240,6 +328,9 @@ std::vector<Eigen::Vector4d> Target::armor_xyza_list() const
 
 bool Target::diverged() const
 {
+  if (ekf_.x.size() != 11 || !ekf_.x.allFinite() || !ekf_.P.allFinite()) return true;
+  if (!geometry_reliable_) return !observed_xyz_.allFinite();
+  if (geometry_) return false;
   auto r_ok = ekf_.x[8] > 0.05 && ekf_.x[8] < 0.5;
   auto l_ok = ekf_.x[8] + ekf_.x[9] > 0.05 && ekf_.x[8] + ekf_.x[9] < 0.5;
 
@@ -266,6 +357,10 @@ bool Target::convergened()
 // 计算出装甲板中心的坐标（考虑长短轴）
 Eigen::Vector3d Target::h_armor_xyz(const Eigen::VectorXd & x, int id) const
 {
+  if (geometry_) {
+    return Eigen::Vector3d(x[0], x[2], x[4]) + axis_basis_ *
+      Eigen::AngleAxisd(x[6], Eigen::Vector3d::UnitZ()) * geometry_->plate_offsets[id];
+  }
   auto angle = tools::limit_rad(x[6] + id * 2 * CV_PI / armor_num_);
   auto use_l_h = (armor_num_ == 4) && (id == 1 || id == 3);
 
@@ -279,6 +374,21 @@ Eigen::Vector3d Target::h_armor_xyz(const Eigen::VectorXd & x, int id) const
 
 Eigen::MatrixXd Target::h_jacobian(const Eigen::VectorXd & x, int id) const
 {
+  if (geometry_) {
+    Eigen::Matrix<double, 4, 11> jacobian = Eigen::Matrix<double, 4, 11>::Zero();
+    constexpr double step = 1e-5;
+    for (int col : {0, 2, 4, 6}) {
+      Eigen::VectorXd plus = x, minus = x;
+      plus[col] += step;
+      minus[col] -= step;
+      Eigen::Vector3d delta = tools::xyz2ypd(h_armor_xyz(plus, id)) - tools::xyz2ypd(h_armor_xyz(minus, id));
+      delta[0] = tools::limit_rad(delta[0]);
+      delta[1] = tools::limit_rad(delta[1]);
+      jacobian.block<3, 1>(0, col) = delta / (2 * step);
+      jacobian(3, col) = tools::limit_rad(armor_yaw(plus, id) - armor_yaw(minus, id)) / (2 * step);
+    }
+    return jacobian;
+  }
   auto angle = tools::limit_rad(x[6] + id * 2 * CV_PI / armor_num_);
   auto use_l_h = (armor_num_ == 4) && (id == 1 || id == 3);
 
@@ -314,6 +424,85 @@ Eigen::MatrixXd Target::h_jacobian(const Eigen::VectorXd & x, int id) const
   // clang-format on
 
   return H_armor_ypda * H_armor_xyza;
+}
+
+double Target::armor_yaw(const Eigen::VectorXd & x, int id) const
+{
+  if (!geometry_) return tools::limit_rad(x[6] + id * 2 * CV_PI / armor_num_);
+  const Eigen::Vector3d normal = axis_basis_ * Eigen::AngleAxisd(x[6], Eigen::Vector3d::UnitZ()) *
+                                 geometry_->plate_normals[id];
+  return std::atan2(normal.y(), normal.x());
+}
+
+bool Target::configure_geometry(const GeometryProfile & profile)
+{
+  if (static_cast<int>(profile.plate_offsets.size()) != armor_num_ ||
+      profile.plate_normals.size() != profile.plate_offsets.size() ||
+      !profile.axis_in_world.allFinite() || profile.axis_in_world.norm() < 1e-6) return false;
+  for (size_t i = 0; i < profile.plate_offsets.size(); ++i) {
+    if (!profile.plate_offsets[i].allFinite() || !profile.plate_normals[i].allFinite() ||
+        profile.plate_normals[i].head<2>().norm() < 1e-6 ||
+        profile.plate_offsets[i].norm() > 2) return false;
+  }
+  geometry_ = profile;
+  axis_basis_ = Eigen::Quaterniond::FromTwoVectors(Eigen::Vector3d::UnitZ(), profile.axis_in_world.normalized()).toRotationMatrix();
+  const Eigen::Vector3d body_normal = axis_basis_.transpose() * observed_normal_;
+  ekf_.x[6] = tools::limit_rad(std::atan2(body_normal.y(), body_normal.x()) -
+    std::atan2(profile.plate_normals[0].y(), profile.plate_normals[0].x()));
+  const Eigen::Vector3d offset = axis_basis_ * Eigen::AngleAxisd(ekf_.x[6], Eigen::Vector3d::UnitZ()) * profile.plate_offsets[0];
+  for (int i = 0; i < 3; ++i) ekf_.x[2 * i] = observed_xyz_[i] - offset[i];
+  // Radius/alternating-height states are unused when mounting positions are calibrated.
+  for (int i : {8, 9, 10}) { ekf_.P.row(i).setZero(); ekf_.P.col(i).setZero(); }
+  geometry_reliable_ = true;
+  return true;
+}
+
+std::chrono::steady_clock::time_point Target::last_observation_time() const
+{
+  return last_observation_time_;
+}
+
+bool Target::pose_reliable() const { return pose_reliable_; }
+
+MotionMode Target::motion_mode() const
+{
+  if (ekf_.x.size() != 11 || rejected_updates_ || !geometry_reliable_ ||
+      std::abs(angular_acceleration_) > 15 || acceleration_variance_ > 900)
+    return MotionMode::uncertain;
+  return std::abs(ekf_.x[7]) < 2 ? MotionMode::translating : MotionMode::rotating;
+}
+
+std::vector<Eigen::Vector4d> Target::aimable_armor_xyza_list() const
+{
+  if (geometry_reliable_) {
+    const auto all = armor_xyza_list();
+    if (jumped || all.empty()) return all;
+    return {all[std::clamp(last_id, 0, static_cast<int>(all.size()) - 1)]};
+  }
+  // Unknown mounting geometry: only follow the observed board; never fabricate
+  // the other three boards from one observation. This mode does not authorize fire.
+  const Eigen::Vector3d xyz = observed_xyz_ + visible_board_velocity_ * std::max(0.0, prediction_horizon_);
+  return {{xyz.x(), xyz.y(), xyz.z(), std::atan2(observed_normal_.y(), observed_normal_.x())}};
+}
+
+bool Target::fire_confident(double future_horizon) const
+{
+  if (!pose_reliable_ || !geometry_reliable_ || diverged() || update_count_ < 4 ||
+      rejected_updates_ || !std::isfinite(future_horizon) || future_horizon < 0) return false;
+  const double horizon = std::max(0.0, prediction_horizon_) + future_horizon;
+  if (motion_mode() == MotionMode::uncertain && horizon > 0.10) return false;
+  // A 3-sigma phase interval must fit within the plate's angular hit window.
+  const double covariance_horizon = std::max(0.0, mean_prediction_horizon_ + future_horizon);
+  const double phase_variance = std::max(0.0, ekf_.P(6, 6) +
+    2 * covariance_horizon * ekf_.P(6, 7) + covariance_horizon * covariance_horizon * ekf_.P(7, 7)) +
+    0.25 * std::pow(horizon, 4) * acceleration_variance_;
+  double radius = std::max(0.05, std::abs(ekf_.x[8]) + std::abs(ekf_.x[9]));
+  if (geometry_) {
+    radius = 0.05;
+    for (const auto & offset : geometry_->plate_offsets) radius = std::max(radius, offset.head<2>().norm());
+  }
+  const double half_width = armor_type == ArmorType::big ? 0.1125 : 0.0675;
+  return std::isfinite(phase_variance) && 3 * std::sqrt(phase_variance) < std::atan2(half_width, radius);
 }
 
 bool Target::checkinit() { return isinit; }

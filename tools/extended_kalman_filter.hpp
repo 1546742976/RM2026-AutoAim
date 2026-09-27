@@ -5,6 +5,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <limits>
 
 namespace tools
 {
@@ -39,17 +40,18 @@ public:
       [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) { return a - b; });
 
   std::map<std::string, double> data;  //卡方检验数据
-  std::deque<int> recent_nis_failures{0};
+  std::deque<int> recent_nis_failures;
   size_t window_size = 100;
-  double last_nis;
+  double last_nis = 0;
+  bool last_update_accepted = false;
+  // Optional hard gate; generic consumers retain their original update behavior.
+  double nis_gate = std::numeric_limits<double>::infinity();
+  static double nis_threshold_95(int measurement_dimension);
 
 private:
   Eigen::MatrixXd I;
   std::function<Eigen::VectorXd(const Eigen::VectorXd &, const Eigen::VectorXd &)> x_add;
 
-  int nees_count_ = 0;
-  int nis_count_ = 0;
-  int total_count_ = 0;
 };
 
 }  // namespace tools

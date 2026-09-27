@@ -71,11 +71,21 @@ int main(int argc, char * argv[])
   io::Command last_command;
 
   decider_sentry.start_nav_thread(&dm_imu);
+  auto previous_mode = gimbal.mode();
 
   while (!exiter.exit()) {
-    camera.read(img, timestamp);
+    io::FramePacket frame;
+    if (!camera.read_for(frame, std::chrono::milliseconds(50))) { gimbal.send(io::Command{}); continue; }
+    img = frame.image;
+    timestamp = frame.exposure_time;
     //Eigen::Quaterniond q = dm_imu.imu_at(timestamp);
     auto q = gimbal.q(timestamp);
+    frame.set_pose(q);
+    const auto mode = gimbal.mode();
+    if (mode != previous_mode) { tracker.reset(); previous_mode = mode; }
+    if (!frame.pose_valid || mode != io::GimbalMode::AUTO_AIM) {
+      tracker.reset(); gimbal.send(io::Command{}); continue;
+    }
     // recorder.record(img, q, timestamp);
 
     /// 自瞄核心逻辑
@@ -124,8 +134,8 @@ int main(int argc, char * argv[])
 
     /// 发射逻辑
     if (tracker.state() != "lost") {
-      Eigen::Quaterniond current_q = gimbal.q(timestamp);
-      Eigen::Vector3d gimbal_pos_shoot = tools::eulers(current_q, 2, 1, 0);
+      const auto gs = gimbal.state();
+      Eigen::Vector3d gimbal_pos_shoot{gs.yaw, gs.pitch, 0};
       command.shoot = shooter.shoot(command, aimer, targets, gimbal_pos_shoot);
     } else {
       command.shoot = false;

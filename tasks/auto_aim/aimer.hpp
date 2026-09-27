@@ -14,14 +14,15 @@ namespace auto_aim
 
 struct AimPoint
 {
-  bool valid;
-  Eigen::Vector4d xyza;
+  bool valid = false;
+  Eigen::Vector4d xyza = Eigen::Vector4d::Zero();
 };
 
 class Aimer
 {
 public:
   AimPoint debug_aim_point;
+  bool fire_allowed() const { return fire_allowed_; }
   explicit Aimer(const std::string & config_path);
   io::Command aim(
     std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
@@ -41,6 +42,8 @@ private:
   double high_speed_delay_time_;
   double low_speed_delay_time_;
   double decision_speed_;
+  double shoot_max_age_ms_ = 100, control_max_age_ms_ = 200;
+  bool fire_allowed_ = false;
 
   AimPoint choose_aim_point(const Target & target);
 };

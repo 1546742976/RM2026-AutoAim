@@ -8,21 +8,21 @@
 
 namespace auto_aim
 {
-YOLO::YOLO(const std::string & config_path, bool debug)
+YOLO::YOLO(const std::string & config_path, bool debug, bool enable_inference)
 {
   auto yaml = YAML::LoadFile(config_path);
   auto yolo_name = yaml["yolo_name"].as<std::string>();
 
   if (yolo_name == "yolov8") {
-    yolo_ = std::make_unique<YOLOV8>(config_path, debug);
+    yolo_ = std::make_unique<YOLOV8>(config_path, debug, enable_inference);
   }
 
   else if (yolo_name == "yolo11") {
-    yolo_ = std::make_unique<YOLO11>(config_path, debug);
+    yolo_ = std::make_unique<YOLO11>(config_path, debug, enable_inference);
   }
 
   else if (yolo_name == "yolov5") {
-    yolo_ = std::make_unique<YOLOV5>(config_path, debug);
+    yolo_ = std::make_unique<YOLOV5>(config_path, debug, enable_inference);
   }
 
   else {

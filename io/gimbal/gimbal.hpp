@@ -14,6 +14,10 @@
 #include "serial/serial.h"
 #include "tools/thread_safe_queue.hpp"
 #include "io/command.hpp"
+#include "io/control_guard.hpp"
+#include "io/control_publisher.hpp"
+#include "tools/pose_history.hpp"
+#include "tools/latency_stats.hpp"
 #include "io/dm_imu/dm_imu.hpp"
 
 
@@ -91,6 +95,7 @@ struct GimbalState
   float pitch_vel;
   float bullet_speed;
   uint16_t bullet_count;
+  std::chrono::steady_clock::time_point timestamp{};
 };
 
 class Gimbal
@@ -110,6 +115,8 @@ public:
   GimbalState state() const;
   std::string str(GimbalMode mode) const;
   Eigen::Quaterniond q(std::chrono::steady_clock::time_point t);
+  void observe_frame(std::chrono::steady_clock::time_point t, const Eigen::Quaterniond & q);
+  void send(io::ControlIntent intent);
 
   void send(
     bool control, bool fire, float yaw, float yaw_vel, float yaw_acc, float pitch, float pitch_vel,
@@ -126,20 +133,25 @@ private:
   std::thread thread_;
   std::atomic<bool> quit_ = false;
   mutable std::mutex mutex_;
+  mutable std::mutex send_mutex_;
+  io::ControlGuard control_guard_;
+  tools::PoseHistory pose_history_;
+  std::unique_ptr<ControlPublisher> publisher_;
+  std::unique_ptr<tools::LatencyStats> send_latency_;
+  bool use_packet_quaternion_ = false;
 
   VisionToGimbal tx_data_gimbal;
   NavData tx_data_nav;
 
   GimbalMode mode_ = GimbalMode::IDLE;
-  GimbalState state_;
-  tools::ThreadSafeQueue<std::tuple<Eigen::Quaterniond, std::chrono::steady_clock::time_point>>
-    queue_{1000};
+  GimbalState state_{};
 
   bool read(uint8_t * buffer, size_t size);
   void read_thread();
   void reconnect();
   void parse_referee_data(uint16_t cmd_id, const uint8_t* data, uint16_t len);
-  void send_gimbal_data() const;
+  bool send_gimbal_data() const;
+  void write_control(const io::ControlIntent & intent);
 
   RefereeCallback referee_callback_;
   NavRefereeCallback nav_referee_callback_;

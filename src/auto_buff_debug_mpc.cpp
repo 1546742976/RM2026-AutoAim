@@ -4,6 +4,7 @@
 
 #include "io/camera.hpp"
 #include "io/gimbal/gimbal.hpp"
+#include "tasks/auto_aim/runtime.hpp"
 #include "tasks/auto_buff/buff_aimer.hpp"
 #include "tasks/auto_buff/buff_detector.hpp"
 #include "tasks/auto_buff/buff_solver.hpp"
@@ -52,9 +53,16 @@ int main(int argc, char * argv[])
   Eigen::Quaterniond q;
   std::chrono::steady_clock::time_point t;
 
+  auto previous_mode = io::GimbalMode::IDLE;
   while (!exiter.exit()) {
-    camera.read(img, t);
+    io::FramePacket frame;
+    if (!camera.read_for(frame, std::chrono::milliseconds(50))) { gimbal.send(io::Command{}); continue; }
+    img = frame.image;
+    t = frame.exposure_time;
     q = gimbal.q(t);
+    const auto mode = gimbal.mode();
+    if (mode != previous_mode) { target = auto_buff::SmallTarget{}; aimer.reset(); previous_mode = mode; }
+    if (mode != io::GimbalMode::SMALL_BUFF || !q.coeffs().allFinite()) { gimbal.send(io::Command{}); continue; }
     auto gs = gimbal.state();
     // recorder.record(img, q, t);
 
@@ -72,9 +80,7 @@ int main(int argc, char * argv[])
 
     auto plan = aimer.mpc_aim(target_copy, t, gs, true);
 
-    gimbal.send(
-      plan.control, plan.fire, plan.yaw, plan.yaw_vel, plan.yaw_acc, plan.pitch, plan.pitch_vel,
-      plan.pitch_acc);
+    gimbal.send(auto_aim::control_intent(plan, gs, frame.frame_id));
     // -------------- 调试输出 --------------
 
     nlohmann::json data;
@@ -90,7 +96,7 @@ int main(int argc, char * argv[])
       data["buff_roll"] = p.ypr_in_world[2] * 57.3;
     }
 
-    if (!target.is_unsolve()) {
+    if (!target.is_unsolve() && power_runes) {
       auto & p = power_runes.value();
 
       // 显示

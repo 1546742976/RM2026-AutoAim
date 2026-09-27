@@ -48,11 +48,13 @@ CBoardUART::CBoardUART(const std::string & config_path)
   mode(Mode::idle),
   shoot_mode(ShootMode::left_shoot),
   ft_angle(0),
-  stop_thread_(false),
-  queue_(5000)
+  stop_thread_(false)
 {
   auto yaml = tools::load(config_path);
   auto com_port = tools::read<std::string>(yaml, "com_port");
+  send_latency_ = std::make_unique<tools::LatencyStats>(yaml["runtime_metrics"].as<bool>(false));
+  control_guard_.configure(yaml["shoot_max_age_ms"].as<double>(100),
+                           yaml["control_max_age_ms"].as<double>(200));
 
   try {
     serial_.setPort(com_port);
@@ -65,12 +67,10 @@ CBoardUART::CBoardUART(const std::string & config_path)
     exit(1);
   }
 
+  publisher_ = std::make_unique<ControlPublisher>(
+    [this](ControlIntent intent) { return control_guard_.apply(intent, mode.load() != Mode::idle); },
+    [this](const ControlIntent & intent) { write_control(intent); });
   thread_ = std::thread(&CBoardUART::read_thread, this);
-
-  tools::logger()->info("[CBoardUART] Waiting for q...");
-  // Wait for initial data to populate interpolation buffer
-  queue_.pop(data_ahead_);
-  queue_.pop(data_behind_);
   tools::logger()->info("[CBoardUART] Opened.");
 }
 
@@ -80,6 +80,12 @@ CBoardUART::~CBoardUART()
   if (thread_.joinable()) {
     thread_.join();
   }
+  publisher_->close();
+  if (send_latency_->enabled()) {
+    const auto stats = send_latency_->summary();
+    tools::logger()->info("[CBoardUART] estimated exposure-to-send: n={} window={} p50={:.2f} p95={:.2f} max={:.2f} ms",
+      stats.total_samples, stats.samples, stats.p50_ms, stats.p95_ms, stats.max_ms);
+  }
   if (serial_.isOpen()) {
     serial_.close();
   }
@@ -87,31 +93,21 @@ CBoardUART::~CBoardUART()
 
 Eigen::Quaterniond CBoardUART::imu_at(std::chrono::steady_clock::time_point timestamp)
 {
-  if (data_behind_.timestamp < timestamp) data_ahead_ = data_behind_;
-
-  while (true) {
-    queue_.pop(data_behind_);
-    if (data_behind_.timestamp > timestamp) break;
-    data_ahead_ = data_behind_;
-  }
-
-  Eigen::Quaterniond q_a = data_ahead_.q.normalized();
-  Eigen::Quaterniond q_b = data_behind_.q.normalized();
-  auto t_a = data_ahead_.timestamp;
-  auto t_b = data_behind_.timestamp;
-  auto t_c = timestamp;
-  std::chrono::duration<double> t_ab = t_b - t_a;
-  std::chrono::duration<double> t_ac = t_c - t_a;
-
-  // Slerp interpolation
-  double k = t_ab.count() == 0 ? 0 : t_ac / t_ab;
-  Eigen::Quaterniond q_c = q_a.slerp(k, q_b).normalized();
-
-  return q_c;
+  auto sample = pose_history_.at(timestamp);
+  control_guard_.observe(timestamp, sample.has_value());
+  return sample ? sample->q : tools::PoseHistory::invalid();
 }
 
 void CBoardUART::send(Command command) const
 {
+  publisher_->publish(control_guard_.apply(ControlIntent{command}, mode.load() != Mode::idle));
+}
+
+void CBoardUART::write_control(const ControlIntent & intent) const
+{
+  auto command = intent.command;
+  if (std::abs(command.yaw) > 3.2767 || std::abs(command.pitch) > 3.2767) command = {};
+  command.horizon_distance = std::clamp(command.horizon_distance, 0.0, 3.2767);
   SendPacket packet;
   packet.control = command.control ? 1 : 0;
   packet.shoot = command.shoot ? 1 : 0;
@@ -128,7 +124,8 @@ void CBoardUART::send(Command command) const
 #endif
   try {
      // Serial write is thread-safe generally, but cast is needed if member is not mutable
-     const_cast<serial::Serial&>(serial_).write(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
+     if (const_cast<serial::Serial&>(serial_).write(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet)) == sizeof(packet))
+       send_latency_->record_first_send(command.source_time);
   } catch (const std::exception & e) {
     tools::logger()->warn("[CBoardUART] Send failed: {}", e.what());
   }
@@ -182,7 +179,7 @@ void CBoardUART::read_thread()
           //plot_json["bullet_speed"] = pkt->bullet_speed;
           plotter.plot(plot_json);
 #endif
-         if ((cal_crc == pkt->crc16) || true) {
+         if (cal_crc == pkt->crc16) {
              auto timestamp = std::chrono::steady_clock::now();
              
              // Process Quaternion from yaw and pitch (roll = 0)
@@ -201,7 +198,7 @@ void CBoardUART::read_thread()
              
              // Validate quaternion
              if (std::abs(w * w + x * x + y * y + z * z - 1) < 1e-2) {
-                 queue_.push({{w, x, y, z}, timestamp});
+                 pose_history_.push({w, x, y, z}, timestamp);
              } else {
                  tools::logger()->warn("[CBoardUART] Invalid quaternion received");
              }
@@ -210,6 +207,7 @@ void CBoardUART::read_thread()
              bullet_speed = pkt->bullet_speed;
              
              // Map packet mode to internal Mode
+             const auto previous_mode = mode.load();
              switch (pkt->mode) {
                  case 0: mode = Mode::idle; break;
                  case 1: mode = Mode::auto_aim; break;
@@ -217,6 +215,7 @@ void CBoardUART::read_thread()
                  case 3: mode = Mode::big_buff; break;
                  default: mode = Mode::idle; break;
              }
+             if (mode.load() != previous_mode) control_guard_.invalidate(timestamp);
              
              // GimbalToVision does not have shoot_mode or ft_angle, so we cannot update them.
 
@@ -227,7 +226,7 @@ void CBoardUART::read_thread()
                 
                 tools::logger()->info(
                     "[CBoardUART] Speed: {:.2f}, Mode: {}",
-                    bullet_speed, mode_str);
+                    bullet_speed.load(), mode_str);
                 last_log = timestamp;
              }
 

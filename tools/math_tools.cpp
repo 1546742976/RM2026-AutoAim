@@ -1,15 +1,16 @@
 #include "math_tools.hpp"
 
 #include <cmath>
+#include <limits>
 #include <opencv2/core.hpp>  // CV_PI
 
 namespace tools
 {
 double limit_rad(double angle)
 {
-  while (angle > CV_PI) angle -= 2 * CV_PI;
-  while (angle <= -CV_PI) angle += 2 * CV_PI;
-  return angle;
+  if (!std::isfinite(angle)) return std::numeric_limits<double>::quiet_NaN();
+  const auto wrapped = std::remainder(angle, 2 * CV_PI);
+  return wrapped <= -CV_PI ? wrapped + 2 * CV_PI : wrapped;
 }
 
 // 四元数转欧拉角

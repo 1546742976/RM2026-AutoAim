@@ -1,6 +1,8 @@
 #include "extended_kalman_filter.hpp"
 
 #include <numeric>
+#include <cmath>
+#include <algorithm>
 
 namespace tools
 {
@@ -14,9 +16,8 @@ ExtendedKalmanFilter::ExtendedKalmanFilter(
   data["residual_distance"] = 0.0;
   data["residual_angle"] = 0.0;
   data["nis"] = 0.0;
-  data["nees"] = 0.0;
   data["nis_fail"] = 0.0;
-  data["nees_fail"] = 0.0;
+  data["update_rejected"] = 0.0;
   data["recent_nis_failures"] = 0.0;
 }
 
@@ -29,8 +30,11 @@ Eigen::VectorXd ExtendedKalmanFilter::predict(
   const Eigen::MatrixXd & F, const Eigen::MatrixXd & Q,
   std::function<Eigen::VectorXd(const Eigen::VectorXd &)> f)
 {
-  P = F * P * F.transpose() + Q;
-  x = f(x);
+  const Eigen::MatrixXd candidate_P = F * P * F.transpose() + Q;
+  const Eigen::VectorXd candidate_x = f(x);
+  if (!candidate_P.allFinite() || !candidate_x.allFinite()) return x;
+  P = (candidate_P + candidate_P.transpose()) * 0.5;
+  x = candidate_x;
   return x;
 }
 
@@ -46,49 +50,50 @@ Eigen::VectorXd ExtendedKalmanFilter::update(
   std::function<Eigen::VectorXd(const Eigen::VectorXd &)> h,
   std::function<Eigen::VectorXd(const Eigen::VectorXd &, const Eigen::VectorXd &)> z_subtract)
 {
-  Eigen::VectorXd x_prior = x;
-  Eigen::MatrixXd K = P * H.transpose() * (H * P * H.transpose() + R).inverse();
-
-  // Stable Compution of the Posterior Covariance
-  // https://github.com/rlabbe/Kalman-and-Bayesian-Filters-in-Python/blob/master/07-Kalman-Filter-Math.ipynb
-  P = (I - K * H) * P * (I - K * H).transpose() + K * R * K.transpose();
-
-  x = x_add(x, K * z_subtract(z, h(x)));
-
-  /// 卡方检验
-  Eigen::VectorXd residual = z_subtract(z, h(x));
-  // 新增检验
-  Eigen::MatrixXd S = H * P * H.transpose() + R;
-  double nis = residual.transpose() * S.inverse() * residual;
-  double nees = (x - x_prior).transpose() * P.inverse() * (x - x_prior);
-
-  // 卡方检验阈值（自由度=4，取置信水平95%）
-  constexpr double nis_threshold = 0.711;
-  constexpr double nees_threshold = 0.711;
-
-  if (nis > nis_threshold) nis_count_++, data["nis_fail"] = 1;
-  if (nees > nees_threshold) nees_count_++, data["nees_fail"] = 1;
-  total_count_++;
-  last_nis = nis;
-
-  recent_nis_failures.push_back(nis > nis_threshold ? 1 : 0);
-
-  if (recent_nis_failures.size() > window_size) {
+  last_update_accepted = false;
+  data["update_rejected"] = 1;
+  const Eigen::VectorXd residual = z_subtract(z, h(x));
+  const Eigen::MatrixXd S = H * P * H.transpose() + R;
+  Eigen::LDLT<Eigen::MatrixXd> factor(S);
+  const bool valid = residual.allFinite() && S.allFinite() &&
+                     factor.info() == Eigen::Success && (factor.vectorD().array() > 0).all();
+  last_nis = valid ? residual.dot(factor.solve(residual)) : std::numeric_limits<double>::infinity();
+  const bool failed = !std::isfinite(last_nis) || last_nis < 0 ||
+                      last_nis > nis_threshold_95(static_cast<int>(z.size()));
+  recent_nis_failures.push_back(failed ? 1 : 0);
+  while (recent_nis_failures.size() > std::max<size_t>(window_size, 1))
     recent_nis_failures.pop_front();
-  }
+  const char * labels[] = {"residual_yaw", "residual_pitch", "residual_distance", "residual_angle"};
+  for (int i = 0; i < 4; ++i) data[labels[i]] = i < residual.size() ? residual[i] : 0;
+  data["nis"] = last_nis;
+  data["nis_fail"] = failed ? 1 : 0;
+  data["recent_nis_failures"] =
+    static_cast<double>(std::accumulate(recent_nis_failures.begin(), recent_nis_failures.end(), 0)) /
+    recent_nis_failures.size();
+  if (!valid || !std::isfinite(last_nis) || last_nis < 0 || last_nis > nis_gate) return x;
 
-  int recent_failures = std::accumulate(recent_nis_failures.begin(), recent_nis_failures.end(), 0);
-  double recent_rate = static_cast<double>(recent_failures) / recent_nis_failures.size();
-
-  data["residual_yaw"] = residual[0];
-  data["residual_pitch"] = residual[1];
-  data["residual_distance"] = residual[2];
-  data["residual_angle"] = residual[3];
-  data["nis"] = nis;
-  data["nees"] = nees;
-  data["recent_nis_failures"] = recent_rate;
-
+  const Eigen::MatrixXd K = factor.solve(H * P).transpose();
+  const Eigen::VectorXd candidate_x = x_add(x, K * residual);
+  const Eigen::MatrixXd correction = I - K * H;
+  const Eigen::MatrixXd candidate_P = correction * P * correction.transpose() + K * R * K.transpose();
+  if (!candidate_x.allFinite() || !candidate_P.allFinite()) return x;
+  x = candidate_x;
+  P = (candidate_P + candidate_P.transpose()) * 0.5;
+  last_update_accepted = true;
+  data["update_rejected"] = 0;
   return x;
+}
+
+double ExtendedKalmanFilter::nis_threshold_95(int dimension)
+{
+  static constexpr double thresholds[] = {
+    0, 3.841459, 5.991465, 7.814728, 9.487729, 11.070498, 12.591587,
+    14.067140, 15.507313, 16.918978, 18.307038, 19.675138, 21.026070};
+  if (dimension > 0 && dimension <= 12) return thresholds[dimension];
+  if (dimension <= 0) return 0;
+  // Wilson-Hilferty approximation for generic higher-dimensional consumers.
+  const double n = dimension;
+  return n * std::pow(1 - 2 / (9 * n) + 1.644853627 * std::sqrt(2 / (9 * n)), 3);
 }
 
 }  // namespace tools

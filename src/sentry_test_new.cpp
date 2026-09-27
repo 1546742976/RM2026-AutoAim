@@ -10,6 +10,7 @@
 #include "io/gimbal/gimbal.hpp"
 #include "io/ros2/ros2.hpp"
 #include "tasks/auto_aim/planner/planner.hpp"
+#include "tasks/auto_aim/runtime.hpp"
 #include "tasks/auto_aim/solver.hpp"
 #include "tasks/auto_aim/tracker.hpp"
 #include "tasks/auto_aim/yolo.hpp"
@@ -47,6 +48,7 @@ int main(int argc, char * argv[])
   auto_aim::Solver solver(config_path);
   auto_aim::Tracker tracker(config_path, solver);
   auto_aim::Planner planner(config_path);
+  std::mutex planner_mutex;
   omniperception::Decider decider(config_path);
 
   tools::ThreadSafeQueue<std::optional<auto_aim::Target>, true> target_queue(1);
@@ -60,19 +62,20 @@ int main(int argc, char * argv[])
   auto plan_thread = std::thread([&]() {
     auto t0 = std::chrono::steady_clock::now();
 
+    std::optional<auto_aim::Target> target;
     while (!quit) {
-      auto target = target_queue.front();
+      std::optional<auto_aim::Target> update;
+      if (target_queue.pop_for(update, 10ms)) target = std::move(update);
+      if (gimbal.mode() != io::GimbalMode::AUTO_AIM) target.reset();
       
-      double bullet_speed = 5.0;
+      const auto feedback = gimbal.state();
+      double bullet_speed = feedback.bullet_speed;
       
-      auto plan = planner.plan(target, bullet_speed);
+      auto_aim::Plan plan;
+      { std::lock_guard<std::mutex> lock(planner_mutex); plan = planner.plan(target, bullet_speed); }
 
       // 发送控制指令
-      gimbal.send(
-        plan.control, plan.fire, 
-        plan.yaw, plan.yaw_vel, plan.yaw_acc, 
-        plan.pitch, plan.pitch_vel, plan.pitch_acc
-      );
+      gimbal.send(auto_aim::control_intent(plan, feedback));
 
       // 在向云台发送控制指令后尝试获取导航目标数据并发送（如果为空就不发送）
       auto nav_data = ros2.get_last_cmd_vel_data();
@@ -114,11 +117,20 @@ int main(int argc, char * argv[])
   cv::Mat img;
   std::chrono::steady_clock::time_point t;
 
+  auto previous_mode = gimbal.mode();
   while (!exiter.exit()) {
-    camera.read(img, t);
+    io::FramePacket frame;
+    if (!camera.read_for(frame, 50ms)) { target_queue.push(std::nullopt); continue; }
+    img = frame.image;
+    t = frame.exposure_time;
     
     // 获取云台位姿作为先验
     Eigen::Quaterniond q = gimbal.q(t);
+    const auto mode = gimbal.mode();
+    if (mode != previous_mode) { tracker.reset(); previous_mode = mode; }
+    if (mode != io::GimbalMode::AUTO_AIM || !q.coeffs().allFinite()) {
+      tracker.reset(); target_queue.push(std::nullopt); continue;
+    }
 
     auto eulers = tools::eulers(q, 2, 1, 0);
     nlohmann::json data;
@@ -156,7 +168,8 @@ int main(int argc, char * argv[])
         tools::draw_points(img, image_points, {255, 255, 0});
       }
 
-      Eigen::Vector4d aim_xyza = planner.debug_xyza;
+      Eigen::Vector4d aim_xyza;
+      { std::lock_guard<std::mutex> lock(planner_mutex); aim_xyza = planner.debug_xyza; }
       auto image_points =
         solver.reproject_armor(aim_xyza.head(3), aim_xyza[3], target.armor_type, target.name);
       tools::draw_points(img, image_points, {0, 0, 255});
@@ -169,6 +182,7 @@ int main(int argc, char * argv[])
   }
 
   quit = true;
+  target_queue.close();
   if (plan_thread.joinable()) plan_thread.join();
   
   gimbal.send(false, false, 0, 0, 0, 0, 0, 0);

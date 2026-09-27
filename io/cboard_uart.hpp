@@ -10,10 +10,10 @@ namespace io
 class CBoardUART
 {
 public:
-    double bullet_speed;
-    Mode mode;
-    ShootMode shoot_mode;
-    double ft_angle;
+    std::atomic<double> bullet_speed{0};
+    std::atomic<Mode> mode{Mode::idle};
+    std::atomic<ShootMode> shoot_mode{ShootMode::left_shoot};
+    std::atomic<double> ft_angle{0};
 
     CBoardUART(const std::string & config_path);
     ~CBoardUART();
@@ -32,9 +32,11 @@ private:
         std::chrono::steady_clock::time_point timestamp;
     };
 
-    tools::ThreadSafeQueue<IMUData> queue_;
-    IMUData data_ahead_;
-    IMUData data_behind_;
+    tools::PoseHistory pose_history_;
+    mutable ControlGuard control_guard_;
+    std::unique_ptr<ControlPublisher> publisher_;
+    std::unique_ptr<tools::LatencyStats> send_latency_;
+    void write_control(const ControlIntent & intent) const;
 
     void read_thread();
 };

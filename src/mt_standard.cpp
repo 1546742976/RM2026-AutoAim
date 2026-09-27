@@ -1,138 +1,125 @@
+#include <atomic>
 #include <chrono>
-#include <opencv2/opencv.hpp>
+#include <exception>
+#include <mutex>
 #include <thread>
-
+#include <opencv2/opencv.hpp>
 #include "io/camera.hpp"
-#include "io/dm_imu/dm_imu.hpp"
-#include "tasks/auto_aim/aimer.hpp"
+#include "io/cboard.hpp"
 #include "tasks/auto_aim/multithread/commandgener.hpp"
 #include "tasks/auto_aim/multithread/mt_detector.hpp"
-#include "tasks/auto_aim/shooter.hpp"
-#include "tasks/auto_aim/solver.hpp"
-#include "tasks/auto_aim/tracker.hpp"
 #include "tasks/auto_buff/buff_aimer.hpp"
 #include "tasks/auto_buff/buff_detector.hpp"
 #include "tasks/auto_buff/buff_solver.hpp"
 #include "tasks/auto_buff/buff_target.hpp"
-#include "tasks/auto_buff/buff_type.hpp"
 #include "tools/exiter.hpp"
-#include "tools/img_tools.hpp"
-#include "tools/logger.hpp"
 #include "tools/math_tools.hpp"
 #include "tools/plotter.hpp"
-#include "tools/recorder.hpp"
-
-const std::string keys =
-  "{help h usage ? | | 输出命令行参数说明}"
-  "{@config-path   | | yaml配置文件路径 }";
 
 using namespace std::chrono_literals;
-
 int main(int argc, char * argv[])
 {
-  cv::CommandLineParser cli(argc, argv, keys);
-  auto config_path = cli.get<std::string>("@config-path");
-  if (cli.has("help") || !cli.has("@config-path")) {
-    cli.printMessage();
-    return 0;
-  }
-
+  cv::CommandLineParser cli(argc, argv,
+    "{help h||}{@config-path|configs/standard3.yaml|yaml configuration}");
+  if (cli.has("help")) { cli.printMessage(); return 0; }
+  const auto config = cli.get<std::string>(0);
   tools::Exiter exiter;
   tools::Plotter plotter;
-  tools::Recorder recorder;
+  io::Camera camera(config);
+  io::CBoard cboard(config);
+  auto_aim::multithread::MultiThreadDetector detector(config, false);
+  auto_aim::Solver solver(config);
+  auto_aim::Tracker tracker(config, solver);
+  auto_aim::Aimer aimer(config);
+  auto_aim::Shooter shooter(config);
+  auto_aim::multithread::CommandGener commands(shooter, aimer, cboard, plotter);
+  auto_buff::Buff_Detector buff_detector(config);
+  auto_buff::Solver buff_solver(config);
+  auto_buff::SmallTarget small;
+  auto_buff::BigTarget big;
+  auto_buff::Aimer buff_aimer(config);
 
-  io::Camera camera(config_path);
-  io::CBoard cboard(config_path);
-
-  auto_aim::multithread::MultiThreadDetector detector(config_path);
-  auto_aim::Solver solver(config_path);
-  auto_aim::Tracker tracker(config_path, solver);
-  auto_aim::Aimer aimer(config_path);
-  auto_aim::Shooter shooter(config_path);
-
-  auto_buff::Buff_Detector buff_detector(config_path);
-  auto_buff::Solver buff_solver(config_path);
-  auto_buff::SmallTarget buff_small_target;
-  auto_buff::BigTarget buff_big_target;
-  auto_buff::Aimer buff_aimer(config_path);
-
-  auto_aim::multithread::CommandGener commandgener(shooter, aimer, cboard, plotter);
-
-  std::atomic<io::Mode> mode{io::Mode::idle};
-  auto last_mode{io::Mode::idle};
-
-  auto detect_thread = std::thread([&]() {
-    cv::Mat img;
-    std::chrono::steady_clock::time_point t;
-
-    while (!exiter.exit()) {
-      if (mode.load() == io::Mode::auto_aim) {
-        camera.read(img, t);
-        detector.push(img, t);
-      } else
-        continue;
+  std::atomic<bool> quit{false};
+  std::mutex failure_mutex;
+  std::exception_ptr failure;
+  const auto fail = [&] {
+    std::lock_guard<std::mutex> lock(failure_mutex);
+    if (!failure) failure = std::current_exception();
+    quit = true;
+  };
+  tools::ThreadSafeQueue<io::FramePacket, true> other_frames(1);
+  std::thread capture([&] {
+    try {
+    while (!quit) {
+      io::FramePacket frame;
+      if (!camera.read_for(frame, 50ms)) continue;
+      const auto mode = cboard.mode.load();
+      if (mode == io::auto_aim || mode == io::outpost)
+        detector.push(frame.image, frame.exposure_time, frame.frame_id);
+      else
+        other_frames.push(std::move(frame));
     }
+    } catch (...) { fail(); }
   });
 
-  while (!exiter.exit()) {
-    mode = cboard.mode;
-
-    if (last_mode != mode) {
-      tools::logger()->info("Switch to {}", io::MODES[mode]);
-      last_mode = mode.load();
+  auto previous = io::idle;
+  auto mode_since = std::chrono::steady_clock::now();
+  try {
+  while (!quit && !exiter.exit()) {
+    const auto mode = cboard.mode.load();
+    if (mode != previous) {
+      mode_since = std::chrono::steady_clock::now();
+      detector.reset();
+      commands.clear();
+      tracker.reset();
+      small = auto_buff::SmallTarget{};
+      big = auto_buff::BigTarget{};
+      buff_aimer.reset();
+      other_frames.clear();
+      previous = mode;
     }
-
-    /// 自瞄
-    if (mode.load() == io::Mode::auto_aim) {
-      auto [img, armors, t] = detector.debug_pop();
-      Eigen::Quaterniond q = cboard.imu_at(t - 1ms);
-
-      // recorder.record(img, q, t);
-
+    if (mode == io::auto_aim || mode == io::outpost) {
+      auto_aim::multithread::MultiThreadDetector::DetectionResult result;
+      if (!detector.pop_for(result, 20ms)) continue;
+      if (result.timestamp < mode_since || cboard.mode.load() != mode) continue;
+      const auto q = cboard.imu_at(result.timestamp);
+      if (!q.coeffs().allFinite()) { tracker.reset(); commands.clear(); continue; }
       solver.set_R_gimbal2world(q);
-
-      Eigen::Vector3d ypr = tools::eulers(solver.R_gimbal2world(), 2, 1, 0);
-
-      auto targets = tracker.track(armors, t);
-
-      commandgener.push(targets, t, cboard.bullet_speed, ypr);  // 发送给决策线程
-
-    }
-
-    /// 打符
-    else if (mode.load() == io::Mode::small_buff || mode.load() == io::Mode::big_buff) {
-      cv::Mat img;
-      Eigen::Quaterniond q;
-      std::chrono::steady_clock::time_point t;
-
-      camera.read(img, t);
-      q = cboard.imu_at(t - 1ms);
-
-      // recorder.record(img, q, t);
-
-      buff_solver.set_R_gimbal2world(q);
-
-      auto power_runes = buff_detector.detect(img);
-
-      buff_solver.solve(power_runes);
-
-      io::Command buff_command;
-      if (mode.load() == io::Mode::small_buff) {
-        buff_small_target.get_target(power_runes, t);
-        auto target_copy = buff_small_target;
-        buff_command = buff_aimer.aim(target_copy, t, cboard.bullet_speed, true);
-      } else if (mode.load() == io::Mode::big_buff) {
-        buff_big_target.get_target(power_runes, t);
-        auto target_copy = buff_big_target;
-        buff_command = buff_aimer.aim(target_copy, t, cboard.bullet_speed, true);
+      auto targets = tracker.track(result.armors, result.timestamp);
+      const auto ypr = tools::eulers(solver.R_gimbal2world(), 2, 1, 0);
+      commands.push(targets, result.timestamp, cboard.bullet_speed.load(), ypr);
+    } else {
+      io::FramePacket frame;
+      if (!other_frames.pop_for(frame, 20ms)) continue;
+      if (frame.exposure_time < mode_since || cboard.mode.load() != mode) continue;
+      frame.set_pose(cboard.imu_at(frame.exposure_time));
+      io::Command command;
+      if (frame.pose_valid && (mode == io::small_buff || mode == io::big_buff)) {
+        buff_solver.set_R_gimbal2world(frame.pose);
+        auto runes = buff_detector.detect(frame.image);
+        buff_solver.solve(runes);
+        if (mode == io::small_buff) {
+          small.get_target(runes, frame.exposure_time);
+          auto target = small;
+          command = buff_aimer.aim(target, frame.exposure_time, cboard.bullet_speed.load(), true);
+        } else {
+          big.get_target(runes, frame.exposure_time);
+          auto target = big;
+          command = buff_aimer.aim(target, frame.exposure_time, cboard.bullet_speed.load(), true);
+        }
+        command.source_time = frame.exposure_time;
+        command.pose_valid = frame.pose_valid;
+        command.frame_id = frame.frame_id;
       }
-      cboard.send(buff_command);
-
-    } else
-      continue;
+      cboard.send(command);
+    }
   }
-
-  detect_thread.join();
-
+  } catch (...) { fail(); }
+  quit = true;
+  detector.close();
+  other_frames.close();
+  capture.join();
+  commands.clear();
+  if (failure) std::rethrow_exception(failure);
   return 0;
 }

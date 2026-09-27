@@ -18,10 +18,15 @@ public:
 
   void set_R_gimbal2world(const Eigen::Quaterniond & q);
 
-  void solve(Armor & armor) const;
+  // Prior must be the same physical plate in a recent frame, not merely the same robot class.
+  void solve(Armor & armor, const Armor * prior = nullptr) const;
 
   std::vector<cv::Point2f> reproject_armor(
     const Eigen::Vector3d & xyz_in_world, double yaw, ArmorType type, ArmorName name) const;
+
+  std::vector<cv::Point2f> reproject_armor(
+    const Eigen::Vector3d & xyz_in_world, const Eigen::Matrix3d & R_armor_to_world,
+    ArmorType type) const;
 
   double oupost_reprojection_error(Armor armor, const double & picth);
 
@@ -34,13 +39,12 @@ private:
   Eigen::Matrix3d R_camera2gimbal_;
   Eigen::Vector3d t_camera2gimbal_;
   Eigen::Matrix3d R_gimbal2world_;
-
-  void optimize_yaw(Armor & armor) const;
-
-  double armor_reprojection_error(const Armor & armor, double yaw, const double & inclined) const;
-  double SJTU_cost(
-    const std::vector<cv::Point2f> & cv_refs, const std::vector<cv::Point2f> & cv_pts,
-    const double & inclined) const;
+  bool gimbal_pose_valid_ = true;
+  double max_reprojection_error_ = 3.0;
+  double max_corner_error_ = 6.0;
+  double min_projected_edge_ = 2.0;
+  double ambiguity_error_gap_ = 0.25;
+  double min_view_cosine_ = 0.1;
 };
 
 }  // namespace auto_aim

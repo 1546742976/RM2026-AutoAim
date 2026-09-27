@@ -57,13 +57,25 @@ int main(int argc, char * argv[])
   auto last_mode = io::GimbalMode::IDLE;
 
   while (!exiter.exit()) {
-    camera.read(img, t);
-    q = dm_imu.imu_at(t - 1ms);
+    io::FramePacket frame;
+    if (!camera.read_for(frame, 50ms)) { gimbal.send(io::Command{}); continue; }
+    img = frame.image;
+    t = frame.exposure_time;
+    q = dm_imu.imu_at(t);
+    frame.set_pose(q);
+    gimbal.observe_frame(t, q);
     mode = gimbal.mode();
 
     if (last_mode != mode) {
       tools::logger()->info("Switch to {}", io::MODES[static_cast<int>(mode)]);
       last_mode = mode;
+      tracker.reset();
+    }
+
+    if (mode != io::GimbalMode::AUTO_AIM || !frame.pose_valid) {
+      tracker.reset();
+      gimbal.send(io::Command{});
+      continue;
     }
 
     // recorder.record(img, q, t);
@@ -77,8 +89,10 @@ int main(int argc, char * argv[])
     auto targets = tracker.track(armors, t);
 
     auto command = aimer.aim(targets, t, gimbal.state().bullet_speed);
+    command.shoot = shooter.shoot(command, aimer, targets, ypr);
+    command.frame_id = frame.frame_id;
 
-    gimbal.send(command.control, command.shoot, command.yaw, 0, 0, command.pitch, 0, 0);
+    gimbal.send(command);
     gimbal.send_imu_forward(dm_imu);
   }
 

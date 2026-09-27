@@ -23,6 +23,16 @@ CommandGener::~CommandGener()
   }
   cv_.notify_all();
   if (thread_.joinable()) thread_.join();
+  cboard_.send({});
+}
+
+void CommandGener::clear()
+{
+  std::lock_guard<std::mutex> lock(mtx_);
+  latest_.reset();
+  ++generation_;
+  cboard_.send({});
+  cv_.notify_all();
 }
 
 void CommandGener::push(
@@ -37,16 +47,19 @@ void CommandGener::push(
 void CommandGener::generate_command()
 {
   auto t0 = std::chrono::steady_clock::now();
-  while (!stop_) {
+  while (true) {
     std::optional<Input> input;
+    uint64_t generation;
     {
-      std::lock_guard<std::mutex> lock(mtx_);
-      if (latest_ && tools::delta_time(std::chrono::steady_clock::now(), latest_->t) < 0.2) {
-        input = latest_;
-      } else
-        input = std::nullopt;
+      std::unique_lock<std::mutex> lock(mtx_);
+      cv_.wait(lock, [&] { return stop_ || latest_.has_value(); });
+      if (stop_) break;
+      input = std::move(latest_);
+      latest_.reset();
+      generation = generation_;
     }
-    if (input) {
+    if (input && (cboard_.mode.load() == io::Mode::auto_aim || cboard_.mode.load() == io::Mode::outpost) &&
+        tools::delta_time(std::chrono::steady_clock::now(), input->t) < 0.2) {
       auto command = aimer_.aim(input->targets_, input->t, input->bullet_speed);
       command.shoot = shooter_.shoot(command, aimer_, input->targets_, input->gimbal_pos);
       command.horizon_distance = input->targets_.empty()
@@ -54,7 +67,10 @@ void CommandGener::generate_command()
                                    : std::sqrt(
                                        tools::square(input->targets_.front().ekf_x()[0]) +
                                        tools::square(input->targets_.front().ekf_x()[2]));
-      cboard_.send(command);
+      {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (generation == generation_ && !stop_) cboard_.send(command);
+      }
       if (debug_) {
         nlohmann::json data;
         data["t"] = tools::delta_time(std::chrono::steady_clock::now(), t0);
@@ -64,8 +80,10 @@ void CommandGener::generate_command()
         data["horizon_distance"] = command.horizon_distance;
         plotter_.plot(data);
       }
+    } else {
+      std::lock_guard<std::mutex> lock(mtx_);
+      if (generation == generation_) cboard_.send({});
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));  //approximately 500Hz
   }
 }
 

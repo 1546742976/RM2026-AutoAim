@@ -9,6 +9,7 @@
 #include "io/camera.hpp"
 #include "io/gimbal/gimbal.hpp"
 #include "tasks/auto_aim/planner/planner.hpp"
+#include "tasks/auto_aim/runtime.hpp"
 #include "tasks/auto_aim/solver.hpp"
 #include "tasks/auto_aim/tracker.hpp"
 #include "tasks/auto_aim/yolo.hpp"
@@ -44,6 +45,7 @@ int main(int argc, char * argv[])
   auto_aim::Solver solver(config_path);
   auto_aim::Tracker tracker(config_path, solver);
   auto_aim::Planner planner(config_path);
+  std::mutex planner_mutex;
 
   tools::ThreadSafeQueue<std::optional<auto_aim::Target>, true> target_queue(1);
   target_queue.push(std::nullopt);
@@ -53,14 +55,16 @@ int main(int argc, char * argv[])
     auto t0 = std::chrono::steady_clock::now();
     uint16_t last_bullet_count = 0;
 
+    std::optional<auto_aim::Target> target;
     while (!quit) {
-      auto target = target_queue.front();
+      std::optional<auto_aim::Target> update;
+      if (target_queue.pop_for(update, 10ms)) target = std::move(update);
+      if (gimbal.mode() != io::GimbalMode::AUTO_AIM) target.reset();
       auto gs = gimbal.state();
-      auto plan = planner.plan(target, gs.bullet_speed);
+      auto_aim::Plan plan;
+      { std::lock_guard<std::mutex> lock(planner_mutex); plan = planner.plan(target, gs.bullet_speed); }
 
-      gimbal.send(
-        plan.control, plan.fire, plan.yaw, plan.yaw_vel, plan.yaw_acc, plan.pitch, plan.pitch_vel,
-        plan.pitch_acc);
+      gimbal.send(auto_aim::control_intent(plan, gs));
 
       auto fired = gs.bullet_count > last_bullet_count;
       last_bullet_count = gs.bullet_count;
@@ -107,9 +111,18 @@ int main(int argc, char * argv[])
   cv::Mat img;
   std::chrono::steady_clock::time_point t;
 
+  auto previous_mode = gimbal.mode();
   while (!exiter.exit()) {
-    camera.read(img, t);
+    io::FramePacket frame;
+    if (!camera.read_for(frame, 50ms)) { target_queue.push(std::nullopt); continue; }
+    img = frame.image;
+    t = frame.exposure_time;
     auto q = gimbal.q(t);
+    const auto mode = gimbal.mode();
+    if (mode != previous_mode) { tracker.reset(); previous_mode = mode; }
+    if (mode != io::GimbalMode::AUTO_AIM || !q.coeffs().allFinite()) {
+      tracker.reset(); target_queue.push(std::nullopt); continue;
+    }
 
     solver.set_R_gimbal2world(q);
     auto armors = yolo.detect(img);
@@ -130,7 +143,8 @@ int main(int argc, char * argv[])
         tools::draw_points(img, image_points, {0, 255, 0});
       }
 
-      Eigen::Vector4d aim_xyza = planner.debug_xyza;
+      Eigen::Vector4d aim_xyza;
+      { std::lock_guard<std::mutex> lock(planner_mutex); aim_xyza = planner.debug_xyza; }
       auto image_points =
         solver.reproject_armor(aim_xyza.head(3), aim_xyza[3], target.armor_type, target.name);
       tools::draw_points(img, image_points, {0, 0, 255});
@@ -143,6 +157,7 @@ int main(int argc, char * argv[])
   }
 
   quit = true;
+  target_queue.close();
   if (plan_thread.joinable()) plan_thread.join();
   gimbal.send(false, false, 0, 0, 0, 0, 0, 0);
 

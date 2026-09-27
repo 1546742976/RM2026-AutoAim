@@ -4,6 +4,7 @@
 #include <Eigen/Dense>
 #include <chrono>
 #include <list>
+#include <map>
 #include <string>
 
 #include "armor.hpp"
@@ -20,6 +21,7 @@ public:
   Tracker(const std::string & config_path, Solver & solver);
 
   std::string state() const;
+  void reset();
 
   std::list<Target> track(
     std::list<Armor> & armors, std::chrono::steady_clock::time_point t,
@@ -42,6 +44,7 @@ private:
   Target target_;
   std::chrono::steady_clock::time_point last_timestamp_;
   ArmorPriority omni_target_priority_;
+  std::map<ArmorName, GeometryProfile> geometry_profiles_;
 
   void state_machine(bool found);
 

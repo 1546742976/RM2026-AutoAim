@@ -51,6 +51,16 @@ void HikRobot::read(cv::Mat & img, std::chrono::steady_clock::time_point & times
   timestamp = data.timestamp;
 }
 
+bool HikRobot::read_for(cv::Mat & img, std::chrono::steady_clock::time_point & timestamp,
+                        std::chrono::milliseconds timeout)
+{
+  CameraData data;
+  if (!queue_.pop_for(data, timeout)) return false;
+  img = std::move(data.img);
+  timestamp = data.timestamp;
+  return true;
+}
+
 void HikRobot::capture_start()
 {
   capturing_ = false;
@@ -88,6 +98,8 @@ void HikRobot::capture_start()
   set_float_value("ExposureTime", exposure_us_);
   set_float_value("Gain", gain_);
   MV_CC_SetFrameRate(handle_, 150);
+  MV_CC_SetImageNodeNum(handle_, 2);
+  MV_CC_SetGrabStrategy(handle_, MV_GrabStrategy_LatestImagesOnly);
 
   ret = MV_CC_StartGrabbing(handle_);
   if (ret != MV_OK) {
@@ -101,7 +113,6 @@ void HikRobot::capture_start()
     capturing_ = true;
 
     MV_FRAME_OUT raw;
-    MV_CC_PIXEL_CONVERT_PARAM cvt_param;
 
     while (!capture_quit_) {
       std::this_thread::sleep_for(1ms);
@@ -118,18 +129,6 @@ void HikRobot::capture_start()
       auto timestamp = std::chrono::steady_clock::now();
       cv::Mat img(cv::Size(raw.stFrameInfo.nWidth, raw.stFrameInfo.nHeight), CV_8U, raw.pBufAddr);
 
-      cvt_param.nWidth = raw.stFrameInfo.nWidth;
-      cvt_param.nHeight = raw.stFrameInfo.nHeight;
-
-      cvt_param.pSrcData = raw.pBufAddr;
-      cvt_param.nSrcDataLen = raw.stFrameInfo.nFrameLen;
-      cvt_param.enSrcPixelType = raw.stFrameInfo.enPixelType;
-
-      cvt_param.pDstBuffer = img.data;
-      cvt_param.nDstBufferSize = img.total() * img.elemSize();
-      cvt_param.enDstPixelType = PixelType_Gvsp_BGR8_Packed;
-
-      // ret = MV_CC_ConvertPixelType(handle_, &cvt_param);
       const auto & frame_info = raw.stFrameInfo;
       auto pixel_type = frame_info.enPixelType;
       cv::Mat dst_image;
@@ -138,7 +137,25 @@ void HikRobot::capture_start()
         {PixelType_Gvsp_BayerRG8, cv::COLOR_BayerRG2RGB},
         {PixelType_Gvsp_BayerGB8, cv::COLOR_BayerGB2RGB},
         {PixelType_Gvsp_BayerBG8, cv::COLOR_BayerBG2RGB}};
-      cv::cvtColor(img, dst_image, type_map.at(pixel_type));
+      try {
+      if (pixel_type == PixelType_Gvsp_BGR8_Packed) {
+        dst_image = cv::Mat(img.rows, img.cols, CV_8UC3, raw.pBufAddr).clone();
+      } else if (pixel_type == PixelType_Gvsp_RGB8_Packed) {
+        cv::cvtColor(cv::Mat(img.rows, img.cols, CV_8UC3, raw.pBufAddr), dst_image, cv::COLOR_RGB2BGR);
+      } else if (pixel_type == PixelType_Gvsp_Mono8) {
+        cv::cvtColor(img, dst_image, cv::COLOR_GRAY2BGR);
+      } else if (type_map.count(pixel_type)) {
+        cv::cvtColor(img, dst_image, type_map.at(pixel_type));
+      } else {
+        tools::logger()->warn("Unsupported camera pixel type: {}", static_cast<int>(pixel_type));
+        MV_CC_FreeImageBuffer(handle_, &raw);
+        continue;
+      }
+      } catch (const cv::Exception & e) {
+        MV_CC_FreeImageBuffer(handle_, &raw);
+        tools::logger()->warn("Camera conversion failed: {}", e.what());
+        break;
+      }
       img = dst_image;
 
       queue_.push({img, timestamp});
@@ -159,19 +176,18 @@ void HikRobot::capture_stop()
 {
   capture_quit_ = true;
   if (capture_thread_.joinable()) capture_thread_.join();
+  if (!handle_) return;
 
   unsigned int ret;
 
   ret = MV_CC_StopGrabbing(handle_);
   if (ret != MV_OK) {
     tools::logger()->warn("MV_CC_StopGrabbing failed: {:#x}", ret);
-    return;
   }
 
   ret = MV_CC_CloseDevice(handle_);
   if (ret != MV_OK) {
     tools::logger()->warn("MV_CC_CloseDevice failed: {:#x}", ret);
-    return;
   }
 
   ret = MV_CC_DestroyHandle(handle_);
@@ -179,6 +195,7 @@ void HikRobot::capture_stop()
     tools::logger()->warn("MV_CC_DestroyHandle failed: {:#x}", ret);
     return;
   }
+  handle_ = nullptr;
 }
 
 void HikRobot::set_float_value(const std::string & name, double value)

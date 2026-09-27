@@ -52,9 +52,16 @@ int main(int argc, char * argv[])
   Eigen::Quaterniond q;
   std::chrono::steady_clock::time_point t;
 
+  auto previous_mode = io::Mode::idle;
   while (!exiter.exit()) {
-    camera.read(img, t);
+    io::FramePacket frame;
+    if (!camera.read_for(frame, std::chrono::milliseconds(50))) { cboard.send({}); continue; }
+    img = frame.image;
+    t = frame.exposure_time;
     q = cboard.imu_at(t);
+    const auto mode = cboard.mode.load();
+    if (mode != previous_mode) { target = auto_buff::SmallTarget{}; aimer.reset(); previous_mode = mode; }
+    if (mode != io::Mode::small_buff || !q.coeffs().allFinite()) { cboard.send({}); continue; }
     // recorder.record(img, q, t);
 
     // -------------- 打符核心逻辑 --------------
@@ -88,7 +95,7 @@ int main(int argc, char * argv[])
       data["buff_roll"] = p.ypr_in_world[2] * 57.3;
     }
 
-    if (!target.is_unsolve()) {
+    if (!target.is_unsolve() && power_runes) {
       auto & p = power_runes.value();
 
       // 显示

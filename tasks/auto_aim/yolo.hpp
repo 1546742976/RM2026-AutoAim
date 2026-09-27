@@ -10,6 +10,7 @@ namespace auto_aim
 class YOLOBase
 {
 public:
+  virtual ~YOLOBase() = default;
   virtual std::list<Armor> detect(const cv::Mat & img, int frame_count) = 0;
 
   virtual std::list<Armor> postprocess(
@@ -19,7 +20,7 @@ public:
 class YOLO
 {
 public:
-  YOLO(const std::string & config_path, bool debug = true);
+  YOLO(const std::string & config_path, bool debug = true, bool enable_inference = true);
 
   std::list<Armor> detect(const cv::Mat & img, int frame_count = -1);
 

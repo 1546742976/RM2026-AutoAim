@@ -85,7 +85,7 @@ private:
 
   Eigen::MatrixXd h_jacobian() const;
 
-  const double SMALL_W = CV_PI / 3;
+  static constexpr double SMALL_W = CV_PI / 3;
   // const double SMALL_W = 0;
 };
 

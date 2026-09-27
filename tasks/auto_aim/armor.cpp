@@ -11,23 +11,27 @@ Lightbar::Lightbar(const cv::RotatedRect & rotated_rect, std::size_t id)
 {
   std::vector<cv::Point2f> corners(4);
   rotated_rect.points(&corners[0]);
-  std::sort(corners.begin(), corners.end(), [](const cv::Point2f & a, const cv::Point2f & b) {
-    return a.y < b.y;
-  });
-
   center = rotated_rect.center;
-  top = (corners[0] + corners[1]) / 2;
-  bottom = (corners[2] + corners[3]) / 2;
+  // Endpoints are midpoints of the short edges, even when a lamp is nearly horizontal.
+  if (cv::norm(corners[0] - corners[1]) <= cv::norm(corners[1] - corners[2])) {
+    top = (corners[0] + corners[1]) / 2;
+    bottom = (corners[2] + corners[3]) / 2;
+    width = cv::norm(corners[0] - corners[1]);
+  } else {
+    top = (corners[1] + corners[2]) / 2;
+    bottom = (corners[3] + corners[0]) / 2;
+    width = cv::norm(corners[1] - corners[2]);
+  }
+  if (top.y > bottom.y) std::swap(top, bottom);
   top2bottom = bottom - top;
 
   points.emplace_back(top);
   points.emplace_back(bottom);
 
-  width = cv::norm(corners[0] - corners[1]);
   angle = std::atan2(top2bottom.y, top2bottom.x);
   angle_error = std::abs(angle - CV_PI / 2);
   length = cv::norm(top2bottom);
-  ratio = length / width;
+  ratio = width > 0 ? length / width : 0;
 }
 
 //传统构造函数

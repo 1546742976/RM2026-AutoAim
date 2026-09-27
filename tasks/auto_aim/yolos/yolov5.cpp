@@ -10,7 +10,7 @@
 
 namespace auto_aim
 {
-YOLOV5::YOLOV5(const std::string & config_path, bool debug)
+YOLOV5::YOLOV5(const std::string & config_path, bool debug, bool enable_inference)
 : debug_(debug), detector_(config_path, false)
 {
   auto yaml = YAML::LoadFile(config_path);
@@ -31,6 +31,7 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
 
   save_path_ = "imgs";
   std::filesystem::create_directory(save_path_);
+  if (!enable_inference) return;  // Async pipeline owns the only compiled detector model.
   auto model = core_.read_model(model_path_);
   ov::preprocess::PrePostProcessor ppp(model);
   auto & input = ppp.input();
@@ -52,6 +53,7 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
   model = ppp.build();
   compiled_model_ = core_.compile_model(
     model, device_, ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY));
+  infer_request_ = compiled_model_.create_infer_request();
 }
 
 std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
@@ -63,13 +65,13 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
 
   cv::Mat bgr_img;
   if (use_roi_) {
-    if (roi_.width == -1) {  // -1 表示该维度不裁切
-      roi_.width = raw_img.cols;
-    }
-    if (roi_.height == -1) {  // -1 表示该维度不裁切
-      roi_.height = raw_img.rows;
-    }
-    bgr_img = raw_img(roi_);
+    auto effective_roi = roi_;
+    if (effective_roi.width == -1) effective_roi.width = raw_img.cols - effective_roi.x;
+    if (effective_roi.height == -1) effective_roi.height = raw_img.rows - effective_roi.y;
+    if (effective_roi.empty() ||
+        (effective_roi & cv::Rect(0, 0, raw_img.cols, raw_img.rows)) != effective_roi)
+      throw std::invalid_argument("Configured detector ROI is outside the camera image");
+    bgr_img = raw_img(effective_roi);
   } else {
     bgr_img = raw_img;
   }
@@ -87,12 +89,11 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
   ov::Tensor input_tensor(ov::element::u8, {1, 640, 640, 3}, input.data);
 
   // infer
-  auto infer_request = compiled_model_.create_infer_request();
-  infer_request.set_input_tensor(input_tensor);
-  infer_request.infer();
+  infer_request_.set_input_tensor(input_tensor);
+  infer_request_.infer();
 
   // postprocess
-  auto output_tensor = infer_request.get_output_tensor();
+  auto output_tensor = infer_request_.get_output_tensor();
   auto output_shape = output_tensor.get_shape();
   cv::Mat output(output_shape[1], output_shape[2], CV_32F, output_tensor.data());
 
@@ -183,6 +184,7 @@ std::list<Armor> YOLOV5::parse(
     // 使用传统方法二次矫正角点
     if (use_traditional_) detector_.detect(*it, bgr_img);
 
+    it->image_size = bgr_img.size();
     it->center_norm = get_center_norm(bgr_img, it->center);
     ++it;
   }

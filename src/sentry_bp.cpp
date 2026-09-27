@@ -60,9 +60,19 @@ int main(int argc, char * argv[])
   std::chrono::steady_clock::time_point timestamp;
   io::Command last_command;
 
+  auto previous_mode = cboard.mode.load();
   while (!exiter.exit()) {
-    camera.read(img, timestamp);
-    Eigen::Quaterniond q = cboard.imu_at(timestamp - 1ms);
+    io::FramePacket frame;
+    if (!camera.read_for(frame, std::chrono::milliseconds(50))) { cboard.send({}); continue; }
+    img = frame.image;
+    timestamp = frame.exposure_time;
+    Eigen::Quaterniond q = cboard.imu_at(timestamp);
+    const auto mode = cboard.mode.load();
+    if (mode != previous_mode) { tracker.reset(); previous_mode = mode; }
+    frame.set_pose(q);
+    if (!frame.pose_valid || (mode != io::auto_aim && mode != io::outpost)) {
+      tracker.reset(); cboard.send({}); continue;
+    }
     // recorder.record(img, q, timestamp);
 
     /// 自瞄核心逻辑

@@ -3,6 +3,8 @@
 #include <yaml-cpp/yaml.h>
 
 #include <tuple>
+#include <algorithm>
+#include <stdexcept>
 
 #include "tools/logger.hpp"
 #include "tools/math_tools.hpp"
@@ -15,7 +17,7 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   temp_lost_count_(0),
   state_{"lost"},
   pre_state_{"lost"},
-  last_timestamp_(std::chrono::steady_clock::now()),
+  last_timestamp_(),
   omni_target_priority_{ArmorPriority::fifth}
 {
   auto yaml = YAML::LoadFile(config_path);
@@ -24,23 +26,53 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   max_temp_lost_count_ = yaml["max_temp_lost_count"].as<int>();
   outpost_max_temp_lost_count_ = yaml["outpost_max_temp_lost_count"].as<int>();
   normal_temp_lost_count_ = max_temp_lost_count_;
+  const auto profiles = yaml["auto_aim_geometry"];
+  if (profiles) {
+    for (size_t id = 0; id + 1 < ARMOR_NAMES.size(); ++id) {
+      const auto profile = profiles[ARMOR_NAMES[id]];
+      if (!profile) continue;
+      auto vector3 = [](const YAML::Node & value) {
+        if (!value.IsSequence() || value.size() != 3)
+          throw std::invalid_argument("geometry vectors must contain three coordinates");
+        return Eigen::Vector3d(value[0].as<double>(), value[1].as<double>(), value[2].as<double>());
+      };
+      GeometryProfile geometry;
+      if (profile["axis_in_world"]) geometry.axis_in_world = vector3(profile["axis_in_world"]);
+      for (const auto & offset : profile["plate_offsets"]) geometry.plate_offsets.push_back(vector3(offset));
+      for (const auto & normal : profile["plate_normals"]) geometry.plate_normals.push_back(vector3(normal));
+      geometry_profiles_.emplace(static_cast<ArmorName>(id), std::move(geometry));
+    }
+  }
 }
 
 std::string Tracker::state() const { return state_; }
 
+void Tracker::reset()
+{
+  target_ = Target{};
+  state_ = pre_state_ = "lost";
+  detect_count_ = temp_lost_count_ = 0;
+  last_timestamp_ = {};
+  omni_target_priority_ = ArmorPriority::fifth;
+}
+
 std::list<Target> Tracker::track(
   std::list<Armor> & armors, std::chrono::steady_clock::time_point t, bool use_enemy_color)
 {
+  if (last_timestamp_ != std::chrono::steady_clock::time_point{} && t <= last_timestamp_) return {};
   auto dt = tools::delta_time(t, last_timestamp_);
   last_timestamp_ = t;
 
   // 时间间隔过长，说明可能发生了相机离线
   if (state_ != "lost" && dt > 0.1) {
     tools::logger()->warn("[Tracker] Large dt: {:.3f}s", dt);
-    state_ = "lost";
+    reset();
+    last_timestamp_ = t;
   }
   // 过滤掉非我方装甲板
-  armors.remove_if([&](const auto_aim::Armor & a) { return a.color != enemy_color_; });
+  armors.remove_if([&](const auto_aim::Armor & a) {
+    return (use_enemy_color && a.color != enemy_color_) || a.name == ArmorName::not_armor;
+  });
 
   // 过滤前哨站顶部装甲板
   // armors.remove_if([this](const auto_aim::Armor & a) {
@@ -51,9 +83,8 @@ std::list<Target> Tracker::track(
 
   // 优先选择靠近图像中心的装甲板
   armors.sort([](const Armor & a, const Armor & b) {
-    cv::Point2f img_center(1440 / 2, 1080 / 2);  // TODO
-    auto distance_1 = cv::norm(a.center - img_center);
-    auto distance_2 = cv::norm(b.center - img_center);
+    auto distance_1 = cv::norm(a.center - cv::Point2f(a.image_size.width / 2.f, a.image_size.height / 2.f));
+    auto distance_2 = cv::norm(b.center - cv::Point2f(b.image_size.width / 2.f, b.image_size.height / 2.f));
     return distance_1 < distance_2;
   });
 
@@ -79,15 +110,8 @@ std::list<Target> Tracker::track(
     return {};
   }
 
-  // 收敛效果检测：
-  if (
-    std::accumulate(
-      target_.ekf().recent_nis_failures.begin(), target_.ekf().recent_nis_failures.end(), 0) >=
-    (0.4 * target_.ekf().window_size)) {
-    tools::logger()->debug("[Target] Bad Converge Found!");
-    state_ = "lost";
-    return {};
-  }
+  // NIS is diagnostic; hard-gated observations count as misses in the state
+  // machine. A 95% diagnostic threshold must not independently reset a track.
 
   if (state_ == "lost") return {};
 
@@ -105,20 +129,27 @@ std::tuple<omniperception::DetectionResult, std::list<Target>> Tracker::track(
     temp_target = detection_queue.front();
   }
 
+  if (last_timestamp_ != std::chrono::steady_clock::time_point{} && t <= last_timestamp_)
+    return {switch_target, {}};
+
   auto dt = tools::delta_time(t, last_timestamp_);
   last_timestamp_ = t;
 
   // 时间间隔过长，说明可能发生了相机离线
   if (state_ != "lost" && dt > 0.1) {
     tools::logger()->warn("[Tracker] Large dt: {:.3f}s", dt);
-    state_ = "lost";
+    reset();
+    last_timestamp_ = t;
   }
+
+  armors.remove_if([&](const Armor & armor) {
+    return (use_enemy_color && armor.color != enemy_color_) || armor.name == ArmorName::not_armor;
+  });
 
   // 优先选择靠近图像中心的装甲板
   armors.sort([](const Armor & a, const Armor & b) {
-    cv::Point2f img_center(1440 / 2, 1080 / 2);  // TODO
-    auto distance_1 = cv::norm(a.center - img_center);
-    auto distance_2 = cv::norm(b.center - img_center);
+    auto distance_1 = cv::norm(a.center - cv::Point2f(a.image_size.width / 2.f, a.image_size.height / 2.f));
+    auto distance_2 = cv::norm(b.center - cv::Point2f(b.image_size.width / 2.f, b.image_size.height / 2.f));
     return distance_1 < distance_2;
   });
 
@@ -230,10 +261,13 @@ void Tracker::state_machine(bool found)
 
 bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::time_point t)
 {
-  if (armors.empty()) return false;
-
-  auto & armor = armors.front();
-  solver_.solve(armor);
+  auto selected = armors.end();
+  for (auto it = armors.begin(); it != armors.end(); ++it) {
+    solver_.solve(*it);
+    if (it->pose_valid) { selected = it; break; }
+  }
+  if (selected == armors.end()) return false;
+  auto & armor = *selected;
 
   // 根据兵种优化初始化参数
   auto is_balance = (armor.type == ArmorType::big) &&
@@ -260,6 +294,11 @@ bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::t
     target_ = Target(armor, t, 0.2, 4, P0_dig);
   }
 
+  const auto geometry = geometry_profiles_.find(armor.name);
+  if (geometry != geometry_profiles_.end() && !target_.configure_geometry(geometry->second)) {
+    tools::logger()->warn("[Tracker] Invalid calibrated geometry for {}", ARMOR_NAMES[armor.name]);
+    return false;
+  }
   return true;
 }
 
@@ -277,6 +316,7 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
 
   if (found_count == 0) return false;
 
+  bool accepted = false;
   for (auto & armor : armors) {
     if (
       armor.name != target_.name || armor.type != target_.armor_type
@@ -287,9 +327,10 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
     solver_.solve(armor);
 
     target_.update(armor);
+    accepted = accepted || target_.last_update_accepted();
   }
 
-  return true;
+  return accepted;
 }
 
 }  // namespace auto_aim

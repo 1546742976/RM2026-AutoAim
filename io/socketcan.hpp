@@ -8,6 +8,8 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <atomic>
+#include <mutex>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
@@ -60,7 +62,8 @@ public:
 
   void write(can_frame * frame) const
   {
-    if (::write(socket_fd_, frame, sizeof(can_frame)) == -1)
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+    if (::write(socket_fd_, frame, sizeof(can_frame)) != sizeof(can_frame))
       throw std::runtime_error("Unable to write!");
   }
 
@@ -68,8 +71,9 @@ private:
   std::string interface_;
   int socket_fd_;
   int epoll_fd_;
-  bool quit_;
-  bool ok_;
+  std::atomic<bool> quit_;
+  std::atomic<bool> ok_;
+  mutable std::mutex socket_mutex_;
   std::thread read_thread_;
   std::thread daemon_thread_;
   can_frame frame_;
@@ -78,10 +82,11 @@ private:
 
   void open()
   {
+    std::lock_guard<std::mutex> lock(socket_mutex_);
     socket_fd_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
     if (socket_fd_ < 0) throw std::runtime_error("Error opening socket!");
 
-    ifreq ifr;
+    ifreq ifr{};
     std::strncpy(ifr.ifr_name, interface_.c_str(), IFNAMSIZ - 1);
     if (ioctl(socket_fd_, SIOCGIFINDEX, &ifr) < 0)
       throw std::runtime_error("Error getting interface index!");
@@ -91,7 +96,6 @@ private:
     addr.can_family = AF_CAN;
     addr.can_ifindex = ifr.ifr_ifindex;
     if (bind(socket_fd_, (sockaddr *)&addr, sizeof(sockaddr_can)) < 0) {
-      ::close(socket_fd_);
       throw std::runtime_error("Error binding socket to interface!");
     }
 
@@ -128,6 +132,7 @@ private:
     try {
       open();
     } catch (const std::exception & e) {
+      close();
       tools::logger()->warn("SocketCAN::open() failed: {}", e.what());
     }
   }
@@ -139,7 +144,7 @@ private:
 
     for (int i = 0; i < num_events; i++) {
       ssize_t num_bytes = recv(socket_fd_, &frame_, sizeof(can_frame), MSG_DONTWAIT);
-      if (num_bytes == -1) throw std::runtime_error("Error reading from SocketCAN!");
+      if (num_bytes != sizeof(can_frame)) throw std::runtime_error("Error reading complete frame from SocketCAN!");
 
       rx_handler_(frame_);
     }
@@ -147,10 +152,16 @@ private:
 
   void close()
   {
-    if (socket_fd_ == -1) return;
-    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, socket_fd_, NULL);
-    ::close(epoll_fd_);
-    ::close(socket_fd_);
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+    if (epoll_fd_ != -1) {
+      if (socket_fd_ != -1) epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, socket_fd_, NULL);
+      ::close(epoll_fd_);
+      epoll_fd_ = -1;
+    }
+    if (socket_fd_ != -1) {
+      ::close(socket_fd_);
+      socket_fd_ = -1;
+    }
   }
 };
 

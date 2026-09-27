@@ -23,6 +23,7 @@ private:
   double first_tolerance_;
   double second_tolerance_;
   bool auto_fire_;
+  double shoot_max_age_ms_ = 100;
 };
 }  // namespace auto_aim
 

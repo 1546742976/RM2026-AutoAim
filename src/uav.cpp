@@ -65,13 +65,22 @@ int main(int argc, char * argv[])
   auto last_mode = io::Mode::idle;
 
   while (!exiter.exit()) {
-    camera.read(img, t);
-    q = cboard.imu_at(t - 1ms);
+    io::FramePacket frame;
+    if (!camera.read_for(frame, std::chrono::milliseconds(50))) { cboard.send({}); continue; }
+    img = frame.image;
+    t = frame.exposure_time;
+    q = cboard.imu_at(t);
+    frame.set_pose(q);
+    if (!frame.pose_valid) { tracker.reset(); cboard.send({}); continue; }
     mode = cboard.mode;
     // recorder.record(img, q, t);
     if (last_mode != mode) {
       tools::logger()->info("Switch to {}", io::MODES[mode]);
       last_mode = mode;
+      tracker.reset();
+      buff_small_target = auto_buff::SmallTarget{};
+      buff_big_target = auto_buff::BigTarget{};
+      buff_aimer.reset();
     }
 
     /// 自瞄
@@ -113,7 +122,7 @@ int main(int argc, char * argv[])
     }
 
     else
-      continue;
+      cboard.send({});
   }
 
   return 0;

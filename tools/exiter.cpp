@@ -1,11 +1,13 @@
 #include "exiter.hpp"
 
 #include <csignal>
+#include <atomic>
 #include <stdexcept>
 
 namespace tools
 {
-bool exit_ = false;
+static_assert(std::atomic<bool>::is_always_lock_free);
+std::atomic<bool> exit_{false};
 bool exiter_inited_ = false;
 
 Exiter::Exiter()

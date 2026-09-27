@@ -59,6 +59,16 @@ void MindVision::read(cv::Mat & img, std::chrono::steady_clock::time_point & tim
   timestamp = data.timestamp;
 }
 
+bool MindVision::read_for(cv::Mat & img, std::chrono::steady_clock::time_point & timestamp,
+                          std::chrono::milliseconds timeout)
+{
+  CameraData data;
+  if (!queue_.pop_for(data, timeout)) return false;
+  img = std::move(data.img);
+  timestamp = data.timestamp;
+  return true;
+}
+
 void MindVision::open()
 {
   int camera_num = 1;
@@ -105,9 +115,9 @@ void MindVision::open()
         break;
       }
 
-      CameraImageProcess(handle_, raw, img.data, &head);
+      const auto process_status = CameraImageProcess(handle_, raw, img.data, &head);
       CameraReleaseImageBuffer(handle_, raw);
-
+      if (process_status != CAMERA_STATUS_SUCCESS) continue;
       queue_.push({img, timestamp});
     }
   }};
@@ -128,6 +138,7 @@ void MindVision::close()
 {
   if (handle_ == -1) return;
   CameraUnInit(handle_);
+  handle_ = -1;
 }
 
 void MindVision::set_vid_pid(const std::string & vid_pid)

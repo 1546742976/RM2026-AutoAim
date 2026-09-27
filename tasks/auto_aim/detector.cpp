@@ -32,6 +32,7 @@ Detector::Detector(const std::string & config_path, bool debug)
 
 std::list<Armor> Detector::detect(const cv::Mat & bgr_img, int frame_count)
 {
+  if (bgr_img.empty()) return {};
   // 彩色图转灰度图
   cv::Mat gray_img;
   cv::cvtColor(bgr_img, gray_img, cv::COLOR_BGR2GRAY);
@@ -39,7 +40,7 @@ std::list<Armor> Detector::detect(const cv::Mat & bgr_img, int frame_count)
   // 进行二值化
   cv::Mat binary_img;
   cv::threshold(gray_img, binary_img, threshold_, 255, cv::THRESH_BINARY);
-  cv::imshow("binary_img", binary_img);
+  if (debug_) cv::imshow("binary_img", binary_img);
 
   // 获取轮廓点
   std::vector<std::vector<cv::Point>> contours;
@@ -79,6 +80,7 @@ std::list<Armor> Detector::detect(const cv::Mat & bgr_img, int frame_count)
       if (!check_type(armor)) continue;
 
       armor.center_norm = get_center_norm(bgr_img, armor.center);
+      armor.image_size = bgr_img.size();
       armors.emplace_back(armor);
     }
   }
@@ -121,6 +123,13 @@ std::list<Armor> Detector::detect(const cv::Mat & bgr_img, int frame_count)
 
 bool Detector::detect(Armor & armor, const cv::Mat & bgr_img)
 {
+  armor.image_size = bgr_img.size();
+  const bool semantic_corners_reliable = armor.corners_reliable;
+  armor.corners_refined = false;
+  armor.corners_reliable = false;
+  if (armor.points.size() != 4 || bgr_img.empty()) return false;
+  for (const auto & point : armor.points)
+    if (!std::isfinite(point.x) || !std::isfinite(point.y)) return false;
   // 取得四个角点
   auto tl = armor.points[0];
   auto tr = armor.points[1];
@@ -135,20 +144,15 @@ bool Detector::detect(Armor & armor, const cv::Mat & bgr_img)
   auto tr1 = (tr + br) / 2 - rt2b;
   auto tl2tr = tr1 - tl1;
   auto bl2br = br1 - bl1;
-  auto tl2 = (tl1 + tr) / 2 - 0.75 * tl2tr;
-  auto tr2 = (tl1 + tr) / 2 + 0.75 * tl2tr;
-  auto bl2 = (bl1 + br) / 2 - 0.75 * bl2br;
-  auto br2 = (bl1 + br) / 2 + 0.75 * bl2br;
+  auto tl2 = (tl1 + tr1) / 2 - 0.75 * tl2tr;
+  auto tr2 = (tl1 + tr1) / 2 + 0.75 * tl2tr;
+  auto bl2 = (bl1 + br1) / 2 - 0.75 * bl2br;
+  auto br2 = (bl1 + br1) / 2 + 0.75 * bl2br;
   // 构造新的四个角点
   std::vector<cv::Point> points = {tl2, tr2, br2, bl2};
   auto armor_rotaterect = cv::minAreaRect(points);
-  cv::Rect boundingBox = armor_rotaterect.boundingRect();
-  // 检查boundingBox是否超出图像边界
-  if (
-    boundingBox.x < 0 || boundingBox.y < 0 || boundingBox.x + boundingBox.width > bgr_img.cols ||
-    boundingBox.y + boundingBox.height > bgr_img.rows) {
-    return false;
-  }
+  cv::Rect boundingBox = armor_rotaterect.boundingRect() & cv::Rect(0, 0, bgr_img.cols, bgr_img.rows);
+  if (boundingBox.empty()) return false;
 
   // 在图像上裁剪出这个矩形区域（ROI）
   cv::Mat armor_roi = bgr_img(boundingBox);
@@ -173,9 +177,12 @@ bool Detector::detect(Armor & armor, const cv::Mat & bgr_img)
     auto rotated_rect = cv::minAreaRect(contour);
     auto lightbar = Lightbar(rotated_rect, lightbar_id);
 
-    if (!check_geometry(lightbar)) continue;
+    // The network already supplies a lamp direction: an image-vertical prior is inappropriate here.
+    if (lightbar.ratio <= min_lightbar_ratio_ || lightbar.ratio >= max_lightbar_ratio_ ||
+        lightbar.length <= min_lightbar_length_) continue;
 
-    lightbar.color = get_color(bgr_img, contour);
+    lightbar.color = get_color(armor_roi, contour);
+    if (lightbar.color != armor.color) continue;
     // lightbar_points_corrector(lightbar, gray_img); //关闭PCA
     lightbars.emplace_back(lightbar);
     lightbar_id += 1;
@@ -191,20 +198,31 @@ bool Detector::detect(Armor & armor, const cv::Mat & bgr_img)
   Lightbar * closest_right_lightbar = nullptr;
   float min_distance_tl_bl = std::numeric_limits<float>::max();
   float min_distance_br_tr = std::numeric_limits<float>::max();
+  bool reverse_left = false, reverse_right = false;
   for (auto & lightbar : lightbars) {
-    float distance_tl_bl =
+    const float direct_left =
       cv::norm(tl - (lightbar.top + cv::Point2f(boundingBox.x, boundingBox.y))) +
       cv::norm(bl - (lightbar.bottom + cv::Point2f(boundingBox.x, boundingBox.y)));
+    const float reversed_left =
+      cv::norm(tl - (lightbar.bottom + cv::Point2f(boundingBox.x, boundingBox.y))) +
+      cv::norm(bl - (lightbar.top + cv::Point2f(boundingBox.x, boundingBox.y)));
+    const float distance_tl_bl = std::min(direct_left, reversed_left);
     if (distance_tl_bl < min_distance_tl_bl) {
       min_distance_tl_bl = distance_tl_bl;
       closest_left_lightbar = &lightbar;
+      reverse_left = reversed_left < direct_left;
     }
-    float distance_br_tr =
+    const float direct_right =
       cv::norm(br - (lightbar.bottom + cv::Point2f(boundingBox.x, boundingBox.y))) +
       cv::norm(tr - (lightbar.top + cv::Point2f(boundingBox.x, boundingBox.y)));
+    const float reversed_right =
+      cv::norm(br - (lightbar.top + cv::Point2f(boundingBox.x, boundingBox.y))) +
+      cv::norm(tr - (lightbar.bottom + cv::Point2f(boundingBox.x, boundingBox.y)));
+    const float distance_br_tr = std::min(direct_right, reversed_right);
     if (distance_br_tr < min_distance_br_tr) {
       min_distance_br_tr = distance_br_tr;
       closest_right_lightbar = &lightbar;
+      reverse_right = reversed_right < direct_right;
     }
   }
 
@@ -218,12 +236,20 @@ bool Detector::detect(Armor & armor, const cv::Mat & bgr_img)
 
   if (
     closest_left_lightbar && closest_right_lightbar &&
-    min_distance_br_tr + min_distance_tl_bl < 15) {
+    closest_left_lightbar != closest_right_lightbar &&
+    min_distance_br_tr + min_distance_tl_bl < std::max(15.0, 0.35 * (cv::norm(lt2b) + cv::norm(rt2b)))) {
     // 将四个点从armor_roi坐标系转换到原始图像坐标系
-    armor.points[0] = closest_left_lightbar->top + cv::Point2f(boundingBox.x, boundingBox.y);
-    armor.points[1] = closest_right_lightbar->top + cv::Point2f(boundingBox.x, boundingBox.y);
-    armor.points[2] = closest_right_lightbar->bottom + cv::Point2f(boundingBox.x, boundingBox.y);
-    armor.points[3] = closest_left_lightbar->bottom + cv::Point2f(boundingBox.x, boundingBox.y);
+    const cv::Point2f offset(boundingBox.x, boundingBox.y);
+    std::vector<cv::Point2f> refined{
+      (reverse_left ? closest_left_lightbar->bottom : closest_left_lightbar->top) + offset,
+      (reverse_right ? closest_right_lightbar->bottom : closest_right_lightbar->top) + offset,
+      (reverse_right ? closest_right_lightbar->top : closest_right_lightbar->bottom) + offset,
+      (reverse_left ? closest_left_lightbar->top : closest_left_lightbar->bottom) + offset};
+    if (!cv::isContourConvex(refined)) return false;
+    armor.points = refined;
+    armor.center = (refined[0] + refined[1] + refined[2] + refined[3]) / 4;
+    armor.corners_refined = true;
+    armor.corners_reliable = semantic_corners_reliable;
     return true;
   }
 

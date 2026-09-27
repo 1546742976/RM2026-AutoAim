@@ -14,12 +14,10 @@
 
 namespace io
 {
-DM_IMU::DM_IMU(QTransform q_transform) : queue_(5000), q_transform_(q_transform)
+DM_IMU::DM_IMU(QTransform q_transform) : q_transform_(q_transform)
 {
   init_serial();
   rec_thread_ = std::thread(&DM_IMU::get_imu_data_thread, this);
-  queue_.pop(data_ahead_);
-  queue_.pop(data_behind_);
   tools::logger()->info("[DM_IMU] initialized");
 }
 
@@ -95,6 +93,7 @@ void DM_IMU::get_imu_data_thread()
       // 读取剩余数据 (57 - 4 = 53 bytes)
       if (serial_.read((uint8_t *)(&receive_data.accx_u32), 53) != 53) continue;
 
+      std::lock_guard<std::mutex> data_lock(data_mutex_);
       uint8_t current_idx = data_idx_.load(std::memory_order_relaxed);
       IMU_Data temp_data = data_buffer_[current_idx];
 
@@ -108,7 +107,8 @@ void DM_IMU::get_imu_data_thread()
         temp_data.gyroy = *((float *)(&receive_data.gyroy_u32));
         temp_data.gyroz = *((float *)(&receive_data.gyroz_u32));
       }
-      if (tools::get_imu_crc16((uint8_t *)(&receive_data.FrameHeader3), 16) == receive_data.crc3) {
+      const bool angles_valid = tools::get_imu_crc16((uint8_t *)(&receive_data.FrameHeader3), 16) == receive_data.crc3;
+      if (angles_valid) {
         temp_data.roll = *((float *)(&receive_data.roll_u32));
         temp_data.pitch = *((float *)(&receive_data.pitch_u32));
         temp_data.yaw = *((float *)(&receive_data.yaw_u32));
@@ -118,6 +118,8 @@ void DM_IMU::get_imu_data_thread()
       data_buffer_[next_idx] = temp_data;
       data_idx_.store(next_idx, std::memory_order_release);
 
+      if (!angles_valid) continue;  // Never stamp previous angles as a new sample.
+
       auto timestamp = std::chrono::steady_clock::now();
       Eigen::Quaterniond q = Eigen::AngleAxisd(temp_data.yaw * M_PI / 180, Eigen::Vector3d::UnitZ()) *
                              Eigen::AngleAxisd(temp_data.pitch * M_PI / 180, Eigen::Vector3d::UnitY()) *
@@ -125,7 +127,7 @@ void DM_IMU::get_imu_data_thread()
       q.normalize();
       q = q_transform_(q);
       q.normalize();
-      queue_.push({q, timestamp});
+      pose_history_.push(q, timestamp);
     } catch (const std::exception & e) { 
       tools::logger()->error("[DM_IMU] error: {}", e.what());
       std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -135,30 +137,12 @@ void DM_IMU::get_imu_data_thread()
 
 Eigen::Quaterniond DM_IMU::imu_at(std::chrono::steady_clock::time_point timestamp)
 {
-  if (data_behind_.timestamp <= timestamp) {
-    while (true) {
-      data_ahead_ = data_behind_;
-      queue_.pop(data_behind_);
-      if (data_behind_.timestamp > timestamp) break;
-    }
-  }
-
-  Eigen::Quaterniond q_a = data_ahead_.q.normalized();
-  Eigen::Quaterniond q_b = data_behind_.q.normalized();
-  auto t_a = data_ahead_.timestamp;
-  auto t_b = data_behind_.timestamp;
-  auto t_c = timestamp;
-  std::chrono::duration<double> t_ab = t_b - t_a;
-  std::chrono::duration<double> t_ac = t_c - t_a;
-
-  // 四元数插值
-  auto k = t_ac / t_ab;
-  Eigen::Quaterniond q_c = q_a.slerp(k, q_b).normalized();
-
-  return q_c;
+  auto sample = pose_history_.at(timestamp);
+  return sample ? sample->q : tools::PoseHistory::invalid();
 }
 
 IMU_Data DM_IMU::current_data() const {
+  std::lock_guard<std::mutex> lock(data_mutex_);
   uint8_t read_idx = data_idx_.load(std::memory_order_acquire);
   return data_buffer_[read_idx]; 
 }
@@ -178,8 +162,7 @@ void DM_IMU::send_command(IMU_COMMAND command, std::optional<uint8_t> param) {
 void DM_IMU::forward_data(const serial::Serial & serial) const {
   IMU_Forward_Frame forward_frame;
   // 直接从当前最新的索引中读取数据，无需加锁，不阻塞写入线程
-  uint8_t read_idx = data_idx_.load(std::memory_order_acquire);
-  forward_frame.data = data_buffer_[read_idx]; 
+  forward_frame.data = current_data();
   
   forward_frame.crc16 = tools::get_crc16((uint8_t *)(&forward_frame.header), sizeof(IMU_Forward_Frame) - sizeof(uint16_t));
   const_cast<serial::Serial &>(serial).write(reinterpret_cast<const uint8_t *>(&forward_frame), sizeof(IMU_Forward_Frame));

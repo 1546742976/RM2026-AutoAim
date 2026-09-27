@@ -136,9 +136,7 @@ int main(int argc, char * argv[])
       data["residual_distance"] = target.ekf().data.at("residual_distance");
       data["residual_angle"] = target.ekf().data.at("residual_angle");
       data["nis"] = target.ekf().data.at("nis");
-      data["nees"] = target.ekf().data.at("nees");
       data["nis_fail"] = target.ekf().data.at("nis_fail");
-      data["nees_fail"] = target.ekf().data.at("nees_fail");
       data["recent_nis_failures"] = target.ekf().data.at("recent_nis_failures");
     }
     cv::resize(img, img, {}, 0.5, 0.5);  // 显示时缩小图片尺寸

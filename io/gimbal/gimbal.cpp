@@ -20,6 +20,10 @@ Gimbal::Gimbal(const std::string & config_path, AfterSendGimbalData after_send_g
 {
   auto yaml = tools::load(config_path);
   auto com_port = tools::read<std::string>(yaml, "com_port");
+  control_guard_.configure(yaml["shoot_max_age_ms"].as<double>(100),
+                           yaml["control_max_age_ms"].as<double>(200));
+  use_packet_quaternion_ = yaml["gimbal_use_packet_quaternion"].as<bool>(false);
+  send_latency_ = std::make_unique<tools::LatencyStats>(yaml["runtime_metrics"].as<bool>(false));
 
   try {
     serial_.setPort(com_port);
@@ -32,16 +36,32 @@ Gimbal::Gimbal(const std::string & config_path, AfterSendGimbalData after_send_g
     exit(1);
   }
 
+  publisher_ = std::make_unique<ControlPublisher>(
+    [this](ControlIntent intent) {
+      auto result = control_guard_.apply(intent, mode() != GimbalMode::IDLE);
+      const auto feedback = state();
+      if (!control_guard_.feedback_fresh(feedback.timestamp) ||
+          !std::isfinite(feedback.yaw) || !std::isfinite(feedback.pitch) ||
+          !std::isfinite(feedback.bullet_speed) || feedback.bullet_speed <= 0)
+        result.command.shoot = false;
+      return result;
+    },
+    [this](const ControlIntent & intent) { write_control(intent); });
   thread_ = std::thread(&Gimbal::read_thread, this);
 
-  queue_.pop();
-  tools::logger()->info("[Gimbal] First q received.");
+  tools::logger()->info("[Gimbal] Waiting for timestamped poses in the receive thread.");
 }
 
 Gimbal::~Gimbal()
 {
   quit_ = true;
   if (thread_.joinable()) thread_.join();
+  publisher_->close();
+  if (send_latency_->enabled()) {
+    const auto stats = send_latency_->summary();
+    tools::logger()->info("[Gimbal] estimated exposure-to-send: n={} window={} p50={:.2f} p95={:.2f} max={:.2f} ms",
+      stats.total_samples, stats.samples, stats.p50_ms, stats.p95_ms, stats.max_ms);
+  }
   serial_.close();
 }
 
@@ -75,57 +95,62 @@ std::string Gimbal::str(GimbalMode mode) const
 
 Eigen::Quaterniond Gimbal::q(std::chrono::steady_clock::time_point t)
 {
-  while (true) {
-    auto [q_a, t_a] = queue_.pop();
-    auto [q_b, t_b] = queue_.front();
-    auto t_ab = tools::delta_time(t_a, t_b);
-    auto t_ac = tools::delta_time(t_a, t);
-    auto k = t_ac / t_ab;
-    Eigen::Quaterniond q_c = q_a.slerp(k, q_b).normalized();
-    if (t < t_a) return q_c;
-    if (!(t_a < t && t <= t_b)) continue;
+  auto sample = pose_history_.at(t);
+  auto pose = sample ? sample->q : tools::PoseHistory::invalid();
+  observe_frame(t, pose);
+  return pose;
+}
 
-    return q_c;
-  }
+void Gimbal::observe_frame(std::chrono::steady_clock::time_point t, const Eigen::Quaterniond & q)
+{
+  control_guard_.observe(t, q.coeffs().allFinite() && q.norm() > 1e-9);
 }
 
 void Gimbal::send(const io::Command & cmd) {
-  send(cmd.control, cmd.shoot, cmd.yaw, 0, 0, cmd.pitch, 0, 0);
+  send(io::ControlIntent{cmd});
 }
 
 void Gimbal::send(io::VisionToGimbal VisionToGimbal)
 {
-  tx_data_gimbal.mode = VisionToGimbal.mode;
-  tx_data_gimbal.yaw = VisionToGimbal.yaw;
-  tx_data_gimbal.yaw_vel = VisionToGimbal.yaw_vel;
-  tx_data_gimbal.yaw_acc = VisionToGimbal.yaw_acc;
-  tx_data_gimbal.pitch = VisionToGimbal.pitch;
-  tx_data_gimbal.pitch_vel = VisionToGimbal.pitch_vel;
-  tx_data_gimbal.pitch_acc = VisionToGimbal.pitch_acc;
-  tx_data_gimbal.crc16 = tools::get_crc16(
-    reinterpret_cast<uint8_t *>(&tx_data_gimbal), sizeof(tx_data_gimbal) - sizeof(tx_data_gimbal.crc16));
-  send_gimbal_data();
+  send(VisionToGimbal.mode != 0, VisionToGimbal.mode == 2, VisionToGimbal.yaw,
+       VisionToGimbal.yaw_vel, VisionToGimbal.yaw_acc, VisionToGimbal.pitch,
+       VisionToGimbal.pitch_vel, VisionToGimbal.pitch_acc);
 }
 
 void Gimbal::send(
   bool control, bool fire, float yaw, float yaw_vel, float yaw_acc, float pitch, float pitch_vel,
   float pitch_acc)
 {
-  tx_data_gimbal.mode = control ? (fire ? 2 : 1) : 0;
-  tx_data_gimbal.yaw = yaw;
-  tx_data_gimbal.yaw_vel = yaw_vel;
-  tx_data_gimbal.yaw_acc = yaw_acc;
-  tx_data_gimbal.pitch = pitch;
-  tx_data_gimbal.pitch_vel = pitch_vel;
-  tx_data_gimbal.pitch_acc = pitch_acc;
+  send(io::ControlIntent{{control, fire, yaw, pitch}, yaw_vel, yaw_acc, pitch_vel, pitch_acc});
+}
+
+void Gimbal::send(io::ControlIntent intent)
+{
+  intent = control_guard_.apply(intent, mode() != GimbalMode::IDLE);
+  publisher_->publish(std::move(intent));
+}
+
+void Gimbal::write_control(const io::ControlIntent & intent)
+{
+  std::unique_lock<std::mutex> send_lock(send_mutex_);
+  tx_data_gimbal.mode = intent.command.control ? (intent.command.shoot ? 2 : 1) : 0;
+  tx_data_gimbal.yaw = intent.command.yaw;
+  tx_data_gimbal.yaw_vel = intent.yaw_vel;
+  tx_data_gimbal.yaw_acc = intent.yaw_acc;
+  tx_data_gimbal.pitch = intent.command.pitch;
+  tx_data_gimbal.pitch_vel = intent.pitch_vel;
+  tx_data_gimbal.pitch_acc = intent.pitch_acc;
   tx_data_gimbal.crc16 = tools::get_crc16(
     reinterpret_cast<uint8_t *>(&tx_data_gimbal), sizeof(tx_data_gimbal) - sizeof(tx_data_gimbal.crc16));
-  send_gimbal_data();
+  if (send_gimbal_data()) send_latency_->record_first_send(intent.command.source_time);
+  send_lock.unlock();
+  if (after_send_gimbal_data_) after_send_gimbal_data_();
 }
 
 void Gimbal::send_cmd_vel(const std::optional<const NavData> & nav_data)
 {
   if (!nav_data.has_value()) return;
+  std::lock_guard<std::mutex> send_lock(send_mutex_);
 
   tx_data_nav.linear_x = nav_data->linear_x;
   tx_data_nav.linear_y = nav_data->linear_y;
@@ -144,6 +169,7 @@ void Gimbal::send_cmd_vel(const std::optional<const NavData> & nav_data)
 }
 
 void Gimbal::send_imu_forward(const DM_IMU & imu) const {
+  std::lock_guard<std::mutex> send_lock(send_mutex_);
   imu.forward_data(serial_);
 }
 
@@ -196,7 +222,7 @@ void Gimbal::read_thread()
       auto t = std::chrono::steady_clock::now();
 
       // Use a local buffer to avoid member-variable aliasing across iterations
-      static GimbalToVision rx_pkt;
+      GimbalToVision rx_pkt{};
       rx_pkt.head[0] = head_byte[0];
       rx_pkt.head[1] = head_byte[1];
 
@@ -217,9 +243,8 @@ void Gimbal::read_thread()
       }
 
       error_count = 0;
-      // Eigen::Quaterniond q(rx_pkt.q[0], rx_pkt.q[1], rx_pkt.q[2], rx_pkt.q[3]);
-      // queue_.push({q, t});
-             // Process Quaternion from yaw and pitch (roll = 0)
+      // Preserve the existing yaw/pitch convention unless the firmware's
+      // quaternion frame has been explicitly verified in configuration.
       double pitch = rx_pkt.pitch;
       double yaw = rx_pkt.yaw;
       
@@ -234,8 +259,12 @@ void Gimbal::read_thread()
       double z = cp * sy;
       
       // Validate quaternion
-      if (std::abs(w * w + x * x + y * y + z * z - 1) < 1e-2) {
-          queue_.push({{w, x, y, z}, t});
+      Eigen::Quaterniond packet_q(rx_pkt.q[0], rx_pkt.q[1], rx_pkt.q[2], rx_pkt.q[3]);
+      if (use_packet_quaternion_) {
+        if (packet_q.coeffs().allFinite() && std::abs(packet_q.squaredNorm() - 1) < 1e-2)
+          pose_history_.push(packet_q, t);
+      } else if (std::abs(w * w + x * x + y * y + z * z - 1) < 1e-2) {
+          pose_history_.push({w, x, y, z}, t);
       } else {
           tools::logger()->warn("[CBoardUART] Invalid quaternion received");
       }
@@ -248,7 +277,9 @@ void Gimbal::read_thread()
         state_.pitch_vel = rx_pkt.pitch_vel;
         state_.bullet_speed = rx_pkt.bullet_speed;
         state_.bullet_count = rx_pkt.bullet_count;
+        state_.timestamp = t;
 
+        const auto previous_mode = mode_;
         switch (rx_pkt.mode) {
           case 0:
             mode_ = GimbalMode::IDLE;
@@ -266,6 +297,10 @@ void Gimbal::read_thread()
             mode_ = GimbalMode::IDLE;
             tools::logger()->warn("[Gimbal] Invalid mode: {}", rx_pkt.mode);
             break;
+        }
+        if (mode_ != previous_mode) {
+          control_guard_.invalidate(t);
+          publisher_->publish({});
         }
 #ifndef NDEBUG
         nlohmann::json data;
@@ -341,18 +376,29 @@ void Gimbal::read_thread()
 
 void Gimbal::reconnect()
 {
+  pose_history_.clear();
+  control_guard_.invalidate();
+  publisher_->publish({});
   int max_retry_count = 10;
   for (int i = 0; i < max_retry_count && !quit_; ++i) {
     tools::logger()->warn("[Gimbal] Reconnecting serial, attempt {}/{}...", i + 1, max_retry_count);
     try {
-      serial_.close();
+      {
+        std::lock_guard<std::mutex> send_lock(send_mutex_);
+        serial_.close();
+      }
       std::this_thread::sleep_for(std::chrono::seconds(1));
     } catch (...) {
     }
 
     try {
-      serial_.open();  // 尝试重新打开
-      queue_.clear();
+      {
+        std::lock_guard<std::mutex> send_lock(send_mutex_);
+        serial_.open();
+      }
+      pose_history_.clear();
+      control_guard_.invalidate();
+      publisher_->publish({});
       tools::logger()->info("[Gimbal] Reconnected serial successfully.");
       break;
     } catch (const std::exception & e) {
@@ -386,14 +432,13 @@ void Gimbal::parse_referee_data(uint16_t cmd_id, const uint8_t* data, uint16_t l
   }
 }
 
-void Gimbal::send_gimbal_data() const {
+bool Gimbal::send_gimbal_data() const {
   try {
-    const_cast<serial::Serial &>(serial_).write(reinterpret_cast<const uint8_t *>(&tx_data_gimbal), sizeof(tx_data_gimbal));
+    return const_cast<serial::Serial &>(serial_).write(
+      reinterpret_cast<const uint8_t *>(&tx_data_gimbal), sizeof(tx_data_gimbal)) == sizeof(tx_data_gimbal);
   } catch (const std::exception & e) {
     tools::logger()->warn("[Gimbal] Failed to write serial: {}", e.what());
-  }
-  if (after_send_gimbal_data_) {
-    after_send_gimbal_data_();
+    return false;
   }
 }
 

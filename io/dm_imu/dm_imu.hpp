@@ -14,6 +14,7 @@
 #include <optional>
 
 #include "tools/thread_safe_queue.hpp"
+#include "tools/pose_history.hpp"
 
 namespace io
 {
@@ -134,8 +135,8 @@ private:
   serial::Serial serial_;
   std::thread rec_thread_;
 
-  tools::ThreadSafeQueue<IMUData> queue_;
-  IMUData data_ahead_, data_behind_;
+  tools::PoseHistory pose_history_;
+  mutable std::mutex data_mutex_;
 
   std::atomic<bool> stop_thread_{false};
   IMU_Receive_Frame receive_data{};  //receive data frame
