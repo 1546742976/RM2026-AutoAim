@@ -69,19 +69,24 @@ CBoardUART::CBoardUART(const std::string & config_path)
   }
 
   publisher_ = std::make_unique<ControlPublisher>(
-    [this](ControlIntent intent) { return control_guard_.apply(intent, mode.load() != Mode::idle); },
-    [this](const ControlIntent & intent) { write_control(intent); });
+    [this](ControlIntent intent) {
+      const auto result = control_guard_.evaluate(intent, mode.load() != Mode::idle);
+      control_diagnostics_.record("CBoardUART", result);
+      return result.intent;
+    },
+    [this](const ControlIntent & intent) { return write_control(intent); });
   thread_ = std::thread(&CBoardUART::read_thread, this);
   tools::logger()->info("[CBoardUART] Opened.");
 }
 
 CBoardUART::~CBoardUART()
 {
+  publisher_->close();
+  log_control_shutdown("CBoardUART", publisher_->status());
   stop_thread_ = true;
   if (thread_.joinable()) {
     thread_.join();
   }
-  publisher_->close();
   if (send_latency_->enabled()) {
     const auto stats = send_latency_->summary();
     tools::logger()->info("[CBoardUART] estimated exposure-to-send: n={} window={} p50={:.2f} p95={:.2f} max={:.2f} ms",
@@ -104,7 +109,7 @@ void CBoardUART::send(Command command) const
   publisher_->publish(control_guard_.apply(ControlIntent{command}, mode.load() != Mode::idle));
 }
 
-void CBoardUART::write_control(const ControlIntent & intent) const
+ControlPublisher::WriteResult CBoardUART::write_control(const ControlIntent & intent) const
 {
   auto command = intent.command;
   if (std::abs(command.yaw) > 3.2767 || std::abs(command.pitch) > 3.2767) command = {};
@@ -123,13 +128,11 @@ void CBoardUART::write_control(const ControlIntent & intent) const
 #else
   packet.checksum = tools::get_crc16(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet) - 2);
 #endif
-  try {
-     // Serial write is thread-safe generally, but cast is needed if member is not mutable
-     if (const_cast<serial::Serial&>(serial_).write(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet)) == sizeof(packet))
-       send_latency_->record_first_send(command.source_time);
-  } catch (const std::exception & e) {
-    tools::logger()->warn("[CBoardUART] Send failed: {}", e.what());
-  }
+  if (const_cast<serial::Serial&>(serial_).write(
+        reinterpret_cast<const uint8_t *>(&packet), sizeof(packet)) != sizeof(packet))
+    return ControlPublisher::WriteResult::failed;
+  if (command.control) send_latency_->record_first_send(command.source_time);
+  return ControlPublisher::WriteResult::complete;
 }
 
 void CBoardUART::read_thread()

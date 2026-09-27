@@ -38,8 +38,12 @@ Gimbal::Gimbal(const std::string & config_path, AfterSendGimbalData after_send_g
   }
 
   publisher_ = std::make_unique<ControlPublisher>(
-    [this](ControlIntent intent) { return control_guard_.apply(intent, mode() != GimbalMode::IDLE); },
-    [this](const ControlIntent & intent) { write_control(intent); });
+    [this](ControlIntent intent) {
+      const auto result = control_guard_.evaluate(intent, mode() != GimbalMode::IDLE);
+      control_diagnostics_.record("Gimbal", result);
+      return result.intent;
+    },
+    [this](const ControlIntent & intent) { return write_control(intent); });
   thread_ = std::thread(&Gimbal::read_thread, this);
 
   tools::logger()->info("[Gimbal] Waiting for timestamped poses in the receive thread.");
@@ -47,9 +51,10 @@ Gimbal::Gimbal(const std::string & config_path, AfterSendGimbalData after_send_g
 
 Gimbal::~Gimbal()
 {
+  publisher_->close();
+  log_control_shutdown("Gimbal", publisher_->status());
   quit_ = true;
   if (thread_.joinable()) thread_.join();
-  publisher_->close();
   if (send_latency_->enabled()) {
     const auto stats = send_latency_->summary();
     tools::logger()->info("[Gimbal] estimated exposure-to-send: n={} window={} p50={:.2f} p95={:.2f} max={:.2f} ms",
@@ -123,7 +128,7 @@ void Gimbal::send(io::ControlIntent intent)
   publisher_->publish(std::move(intent));
 }
 
-void Gimbal::write_control(const io::ControlIntent & intent)
+ControlPublisher::WriteResult Gimbal::write_control(const io::ControlIntent & intent)
 {
   std::unique_lock<std::mutex> send_lock(send_mutex_);
   tx_data_gimbal.mode = intent.command.control ? (intent.command.shoot ? 2 : 1) : 0;
@@ -135,9 +140,12 @@ void Gimbal::write_control(const io::ControlIntent & intent)
   tx_data_gimbal.pitch_acc = intent.pitch_acc;
   tx_data_gimbal.crc16 = tools::get_crc16(
     reinterpret_cast<uint8_t *>(&tx_data_gimbal), sizeof(tx_data_gimbal) - sizeof(tx_data_gimbal.crc16));
-  if (send_gimbal_data()) send_latency_->record_first_send(intent.command.source_time);
+  if (!send_gimbal_data()) return ControlPublisher::WriteResult::failed;
+  if (intent.command.control) send_latency_->record_first_send(intent.command.source_time);
   send_lock.unlock();
-  if (after_send_gimbal_data_) after_send_gimbal_data_();
+  // Ancillary callbacks must not run again during the final stop attempt.
+  if (intent.command.control && after_send_gimbal_data_) after_send_gimbal_data_();
+  return ControlPublisher::WriteResult::complete;
 }
 
 void Gimbal::send_cmd_vel(const std::optional<const NavData> & nav_data)
@@ -434,13 +442,8 @@ void Gimbal::parse_referee_data(uint16_t cmd_id, const uint8_t* data, uint16_t l
 }
 
 bool Gimbal::send_gimbal_data() const {
-  try {
-    return const_cast<serial::Serial &>(serial_).write(
-      reinterpret_cast<const uint8_t *>(&tx_data_gimbal), sizeof(tx_data_gimbal)) == sizeof(tx_data_gimbal);
-  } catch (const std::exception & e) {
-    tools::logger()->warn("[Gimbal] Failed to write serial: {}", e.what());
-    return false;
-  }
+  return const_cast<serial::Serial &>(serial_).write(
+    reinterpret_cast<const uint8_t *>(&tx_data_gimbal), sizeof(tx_data_gimbal)) == sizeof(tx_data_gimbal);
 }
 
 } // namespace io

@@ -13,14 +13,19 @@ CBoard::CBoard(const std::string & config_path)
 // 注意: callback的运行会早于Cboard构造函数的完成
 {
   publisher_ = std::make_unique<ControlPublisher>(
-    [this](ControlIntent intent) { return control_guard_.apply(intent, mode.load() != Mode::idle); },
-    [this](const ControlIntent & intent) { write_control(intent); });
+    [this](ControlIntent intent) {
+      const auto result = control_guard_.evaluate(intent, mode.load() != Mode::idle);
+      control_diagnostics_.record("CBoard", result);
+      return result.intent;
+    },
+    [this](const ControlIntent & intent) { return write_control(intent); });
   tools::logger()->info("[Cboard] Opened.");
 }
 
 CBoard::~CBoard()
 {
   publisher_->close();
+  log_control_shutdown("CBoard", publisher_->status());
   if (send_latency_->enabled()) {
     const auto stats = send_latency_->summary();
     tools::logger()->info("[CBoard] estimated exposure-to-send: n={} window={} p50={:.2f} p95={:.2f} max={:.2f} ms",
@@ -40,7 +45,7 @@ void CBoard::send(Command command) const
   publisher_->publish(control_guard_.apply(ControlIntent{command}, mode.load() != Mode::idle));
 }
 
-void CBoard::write_control(const ControlIntent & intent) const
+ControlPublisher::WriteResult CBoard::write_control(const ControlIntent & intent) const
 {
   auto command = intent.command;
   // Fixed-point protocol cannot represent out-of-range values. Reject instead
@@ -60,12 +65,9 @@ void CBoard::write_control(const ControlIntent & intent) const
   frame.data[6] = (int16_t)(command.horizon_distance * 1e4) >> 8;
   frame.data[7] = (int16_t)(command.horizon_distance * 1e4);
 
-  try {
-    can_.write(&frame);
-    send_latency_->record_first_send(command.source_time);
-  } catch (const std::exception & e) {
-    tools::logger()->warn("{}", e.what());
-  }
+  can_.write(&frame);  // Publisher catches and preserves the transport exception.
+  if (command.control) send_latency_->record_first_send(command.source_time);
+  return ControlPublisher::WriteResult::complete;
 }
 
 void CBoard::callback(const can_frame & frame)

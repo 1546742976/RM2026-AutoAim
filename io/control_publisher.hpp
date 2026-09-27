@@ -2,8 +2,10 @@
 #define IO__CONTROL_PUBLISHER_HPP
 
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include "io/command.hpp"
 
@@ -13,24 +15,46 @@ namespace io
 class ControlPublisher
 {
 public:
+  // Host write completion only; this is not an acknowledgement from the device.
+  enum class WriteResult { complete, failed };
+  struct Status {
+    std::exception_ptr failure;
+    std::exception_ptr stop_failure;
+    bool stop_attempted = false;
+    bool stop_written = false;
+  };
   using Filter = std::function<ControlIntent(ControlIntent)>;
-  using Write = std::function<void(const ControlIntent &)>;
+  using Write = std::function<WriteResult(const ControlIntent &)>;
   ControlPublisher(Filter filter, Write write) : filter_(std::move(filter)), write_(std::move(write)),
     worker_([this] { run(); }) {}
-  ~ControlPublisher() { close(); }
+  ~ControlPublisher() noexcept { close(); }
   void publish(ControlIntent intent)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (closed_) return;
+    if (closed_ || status_.failure) return;
     latest_ = std::move(intent);
     dirty_ = true;
     changed_.notify_one();
   }
-  void close()
+  Status status() const
   {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return status_;
+  }
+  void rethrow_if_failed() const
+  {
+    const auto state = status();
+    if (state.failure) std::rethrow_exception(state.failure);
+  }
+  // Called by owners, never by a filter/write callback. Serialize concurrent closers.
+  void close() noexcept
+  {
+    std::lock_guard<std::mutex> close_lock(close_mutex_);
     {
       std::lock_guard<std::mutex> lock(mutex_);
       closed_ = true;
+      latest_ = {};
+      dirty_ = false;
     }
     changed_.notify_one();
     if (worker_.joinable()) worker_.join();
@@ -38,16 +62,19 @@ public:
 private:
   Filter filter_;
   Write write_;
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
+  std::mutex close_mutex_;
   std::condition_variable changed_;
   ControlIntent latest_{};
   bool dirty_ = false, closed_ = false;
+  Status status_;
   std::thread worker_;
-  void run()
+  void run() noexcept
   {
     using Clock = std::chrono::steady_clock;
     auto next_send = Clock::now();
     bool was_active = false;
+    try {
     while (true) {
       ControlIntent intent;
       {
@@ -62,11 +89,33 @@ private:
         dirty_ = false;
       }
       intent = filter_(intent);
-      write_(intent);
+      if (write_(intent) != WriteResult::complete)
+        throw std::runtime_error("Control transport write incomplete");
       was_active = intent.command.control;
       next_send = Clock::now() + std::chrono::milliseconds(10);
     }
-    write_({});
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      status_.failure = std::current_exception();
+      closed_ = true;
+      latest_ = {};
+      dirty_ = false;
+    }
+    // Exactly one best-effort stop, including when the normal write failed.
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      status_.stop_attempted = true;
+    }
+    try {
+      if (write_({}) != WriteResult::complete)
+        throw std::runtime_error("Control transport stop write incomplete");
+      std::lock_guard<std::mutex> lock(mutex_);
+      status_.stop_written = true;
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      status_.stop_failure = std::current_exception();
+      if (!status_.failure) status_.failure = status_.stop_failure;
+    }
   }
 };
 }  // namespace io

@@ -13,6 +13,7 @@
 #include "io/command.hpp"
 #include "io/control_guard.hpp"
 #include "io/control_publisher.hpp"
+#include "io/control_diagnostics.hpp"
 #include "tools/pose_history.hpp"
 #include "tools/latency_stats.hpp"
 #include "io/socketcan.hpp"
@@ -55,10 +56,13 @@ public:
   Eigen::Quaterniond imu_at(std::chrono::steady_clock::time_point timestamp);
 
   virtual void send(Command command) const;
+  void rethrow_if_failed() const { publisher_->rethrow_if_failed(); }
+  ControlPublisher::Status control_status() const { return publisher_->status(); }
 
 private:
   tools::PoseHistory pose_history_;
   mutable ControlGuard control_guard_;
+  ControlDiagnostics control_diagnostics_;
   std::unique_ptr<ControlPublisher> publisher_;
   std::unique_ptr<tools::LatencyStats> send_latency_;
   SocketCAN can_;
@@ -66,7 +70,7 @@ private:
   int quaternion_canid_, bullet_speed_canid_, send_canid_;
 
   void callback(const can_frame & frame);
-  void write_control(const ControlIntent & intent) const;
+  ControlPublisher::WriteResult write_control(const ControlIntent & intent) const;
 
   std::string read_yaml(const std::string & config_path);
 };

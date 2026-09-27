@@ -13,6 +13,18 @@ class ControlGuard
 {
 public:
   using Clock = std::chrono::steady_clock;
+  enum Reason : uint32_t {
+    disabled = 1u << 0, missing_source = 1u << 1, previous_mode = 1u << 2,
+    future_time = 1u << 3, control_expired = 1u << 4, pose_invalid = 1u << 5,
+    uncalibrated = 1u << 6, shoot_expired = 1u << 7,
+    pose_feedback_invalid = 1u << 8, status_feedback_invalid = 1u << 9,
+    pose_feedback_stale = 1u << 10, status_feedback_stale = 1u << 11,
+    nonfinite = 1u << 12, deadline_expired = 1u << 13
+  };
+  struct Evaluation {
+    ControlIntent intent;
+    uint32_t reasons = 0;
+  };
   void configure(double shoot_ms, double control_ms, bool timing_calibrated = false)
   {
     if (!std::isfinite(shoot_ms) || !std::isfinite(control_ms) ||
@@ -73,9 +85,15 @@ public:
   }
   ControlIntent apply(ControlIntent intent, bool enabled, Clock::time_point now = Clock::now()) const
   {
+    return evaluate(intent, enabled, now).intent;
+  }
+  Evaluation evaluate(ControlIntent intent, bool enabled, Clock::time_point now = Clock::now()) const
+  {
     std::lock_guard<std::mutex> lock(mutex_);
     auto & cmd = intent.command;
+    uint32_t reasons = intent.inhibit_reasons;
     if (cmd.source_time == Clock::time_point{}) {
+      reasons |= missing_source;
       // Legacy commands may track, but a frame timestamp cannot be invented
       // to renew an otherwise untraceable fire request.
       cmd.source_time = frame_time_;
@@ -83,17 +101,40 @@ public:
     }
     const double age_ms = std::chrono::duration<double, std::milli>(now - cmd.source_time).count();
     const double pose_age_ms = std::chrono::duration<double, std::milli>(now - frame_time_).count();
+    if (!enabled) reasons |= disabled;
+    if (!pose_valid_ || !cmd.pose_valid) reasons |= pose_invalid;
+    if (cmd.source_time < mode_since_) reasons |= previous_mode;
+    if (age_ms < 0 || pose_age_ms < 0) reasons |= future_time;
+    if (age_ms > control_age_ || pose_age_ms > control_age_) reasons |= control_expired;
+    if (!timing_calibrated_) reasons |= uncalibrated;
+    if (age_ms > shoot_age_ || pose_age_ms > shoot_age_) reasons |= shoot_expired;
+    if (!pose_feedback_valid_) reasons |= pose_feedback_invalid;
+    if (!status_feedback_valid_) reasons |= status_feedback_invalid;
+    if (!feedback_fresh_locked(pose_feedback_time_, now)) reasons |= pose_feedback_stale;
+    if (!feedback_fresh_locked(status_feedback_time_, now)) reasons |= status_feedback_stale;
+    if (!std::isfinite(cmd.yaw) || !std::isfinite(cmd.pitch) ||
+        !std::isfinite(cmd.horizon_distance) || !std::isfinite(intent.yaw_vel) ||
+        !std::isfinite(intent.yaw_acc) || !std::isfinite(intent.pitch_vel) ||
+        !std::isfinite(intent.pitch_acc)) reasons |= nonfinite;
+    if (cmd.valid_until != Clock::time_point{} && now > cmd.valid_until)
+      reasons |= deadline_expired;
+    // Retain only provenance on a stop, never the rejected numerical command.
+    const auto source_time = cmd.source_time;
+    const auto frame_id = cmd.frame_id;
     if (!enabled || !pose_valid_ || cmd.source_time < mode_since_ ||
         cmd.source_time == Clock::time_point{} || age_ms < 0 ||
         age_ms > control_age_ || pose_age_ms < 0 || pose_age_ms > control_age_)
-      return {};
-    if (!timing_calibrated_ || age_ms > shoot_age_ || pose_age_ms > shoot_age_ ||
+      intent = {};
+    else if (!timing_calibrated_ || age_ms > shoot_age_ || pose_age_ms > shoot_age_ ||
         !pose_feedback_valid_ || !status_feedback_valid_ ||
         !feedback_fresh_locked(pose_feedback_time_, now) ||
         !feedback_fresh_locked(status_feedback_time_, now))
       cmd.shoot = false;
     intent.expire(now);
-    return intent;
+    intent.command.source_time = source_time;
+    intent.command.frame_id = frame_id;
+    intent.inhibit_reasons = reasons;
+    return {intent, reasons};
   }
 private:
   mutable std::mutex mutex_;

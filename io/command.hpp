@@ -25,6 +25,8 @@ struct ControlIntent
 {
   Command command;
   double yaw_vel = 0, yaw_acc = 0, pitch_vel = 0, pitch_acc = 0;
+  // Internal diagnostics survive submission-time filtering; never serialized.
+  uint32_t inhibit_reasons = 0;
 
   void expire(std::chrono::steady_clock::time_point now)
   {
