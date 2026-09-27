@@ -317,4 +317,12 @@ cmake --build build/codex-release -j2
 ctest --test-dir build/codex-release -R '^(runtime_contracts|command_worker_contracts)$' --output-on-failure
 ```
 
-本轮结果：待本轮构建和测试完成后填写；不沿用上一轮通过记录。
+本轮实现已包含在 `351cfa6`（链路优化）中。恢复核对的 WSL 验证记录如下：
+
+- 上一轮 `cmake --build build/codex-release -j2 && ctest ...` 顺序执行至测试阶段，Release 构建成功；普通、异步、MPC、打符、无人机及 ROS2 哨兵入口参与构建。
+- `build/codex-release/Testing/Temporary/LastTest.log` 记录于 **2026-09-28 01:28 CST**：`runtime_contracts` 通过（0.04 秒），`command_worker_contracts` 通过（0.23 秒），所选两组测试 **2/2 通过**。
+- 覆盖过滤回调异常、写失败/短写返回值、写回调抛异常、停止写入失败保留首次故障、重复关闭、故障后拒绝新提交，以及过滤或计算期间关闭/清空时丢弃旧结果。
+- 命令线程测试使用注入回调；没有打开相机、串口、CAN 或云台设备。诊断测试检查多原因保留、来源元数据及不提升已有开火许可。
+- 此次收尾复用了上述测试记录，没有重新运行识别/PnP/弹道测试或实机测试。仅修正文档不要求重跑已通过的代码测试。
+
+软件侧安全维护与对应定向测试已完成。时间标定、下位机独立停机和 NUC 实测仍为未验证，不能据此认定整套项目已完成实机验收。
