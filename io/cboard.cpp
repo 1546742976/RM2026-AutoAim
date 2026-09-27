@@ -73,25 +73,36 @@ void CBoard::callback(const can_frame & frame)
   auto timestamp = std::chrono::steady_clock::now();
 
   if (frame.can_id == quaternion_canid_) {
-    if (frame.can_dlc < 8) return;
+    if (frame.can_dlc < 8) {
+      control_guard_.observe_pose_feedback(timestamp, false);
+      return;
+    }
     auto x = (int16_t)(frame.data[0] << 8 | frame.data[1]) / 1e4;
     auto y = (int16_t)(frame.data[2] << 8 | frame.data[3]) / 1e4;
     auto z = (int16_t)(frame.data[4] << 8 | frame.data[5]) / 1e4;
     auto w = (int16_t)(frame.data[6] << 8 | frame.data[7]) / 1e4;
 
     if (std::abs(x * x + y * y + z * z + w * w - 1) > 1e-2) {
+      control_guard_.observe_pose_feedback(timestamp, false);
       tools::logger()->warn("Invalid q: {} {} {} {}", w, x, y, z);
       return;
     }
 
     pose_history_.push({w, x, y, z}, timestamp);
+    control_guard_.observe_pose_feedback(timestamp, true);
   }
 
   else if (frame.can_id == bullet_speed_canid_) {
-    if (frame.can_dlc < 6) return;
-    bullet_speed = (int16_t)(frame.data[0] << 8 | frame.data[1]) / 1e2;
+    if (frame.can_dlc < 6) {
+      control_guard_.observe_status_feedback(timestamp, 0);
+      return;
+    }
+    const auto received_speed = (int16_t)(frame.data[0] << 8 | frame.data[1]) / 1e2;
     const auto new_mode = frame.data[2] <= Mode::outpost ? Mode(frame.data[2]) : Mode::idle;
-    if (mode.exchange(new_mode) != new_mode) control_guard_.invalidate(timestamp);
+    if (mode.load() != new_mode) control_guard_.invalidate();
+    mode = new_mode;
+    control_guard_.observe_status_feedback(timestamp, received_speed);
+    bullet_speed = received_speed;
     shoot_mode = frame.data[3] <= ShootMode::both_shoot ? ShootMode(frame.data[3]) : ShootMode::left_shoot;
     ft_angle = (int16_t)(frame.data[4] << 8 | frame.data[5]) / 1e4;
 
@@ -114,7 +125,8 @@ std::string CBoard::read_yaml(const std::string & config_path)
   auto yaml = tools::load(config_path);
   send_latency_ = std::make_unique<tools::LatencyStats>(yaml["runtime_metrics"].as<bool>(false));
   control_guard_.configure(yaml["shoot_max_age_ms"].as<double>(100),
-                           yaml["control_max_age_ms"].as<double>(200));
+                           yaml["control_max_age_ms"].as<double>(200),
+                           yaml["camera_timing_calibrated"].as<bool>(false));
 
   quaternion_canid_ = tools::read<int>(yaml, "quaternion_canid");
   bullet_speed_canid_ = tools::read<int>(yaml, "bullet_speed_canid");

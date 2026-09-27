@@ -54,7 +54,8 @@ CBoardUART::CBoardUART(const std::string & config_path)
   auto com_port = tools::read<std::string>(yaml, "com_port");
   send_latency_ = std::make_unique<tools::LatencyStats>(yaml["runtime_metrics"].as<bool>(false));
   control_guard_.configure(yaml["shoot_max_age_ms"].as<double>(100),
-                           yaml["control_max_age_ms"].as<double>(200));
+                           yaml["control_max_age_ms"].as<double>(200),
+                           yaml["camera_timing_calibrated"].as<bool>(false));
 
   try {
     serial_.setPort(com_port);
@@ -197,7 +198,8 @@ void CBoardUART::read_thread()
              double z = cp * sy;
              
              // Validate quaternion
-             if (std::abs(w * w + x * x + y * y + z * z - 1) < 1e-2) {
+             const bool pose_valid = std::abs(w * w + x * x + y * y + z * z - 1) < 1e-2;
+             if (pose_valid) {
                  pose_history_.push({w, x, y, z}, timestamp);
              } else {
                  tools::logger()->warn("[CBoardUART] Invalid quaternion received");
@@ -207,15 +209,17 @@ void CBoardUART::read_thread()
              bullet_speed = pkt->bullet_speed;
              
              // Map packet mode to internal Mode
-             const auto previous_mode = mode.load();
+             auto new_mode = Mode::idle;
              switch (pkt->mode) {
-                 case 0: mode = Mode::idle; break;
-                 case 1: mode = Mode::auto_aim; break;
-                 case 2: mode = Mode::small_buff; break;
-                 case 3: mode = Mode::big_buff; break;
-                 default: mode = Mode::idle; break;
+                 case 0: new_mode = Mode::idle; break;
+                 case 1: new_mode = Mode::auto_aim; break;
+                 case 2: new_mode = Mode::small_buff; break;
+                 case 3: new_mode = Mode::big_buff; break;
+                 default: new_mode = Mode::idle; break;
              }
-             if (mode.load() != previous_mode) control_guard_.invalidate(timestamp);
+             if (mode.load() != new_mode) control_guard_.invalidate();
+             mode = new_mode;
+             control_guard_.observe_feedback(timestamp, pose_valid, bullet_speed.load());
              
              // GimbalToVision does not have shoot_mode or ft_angle, so we cannot update them.
 

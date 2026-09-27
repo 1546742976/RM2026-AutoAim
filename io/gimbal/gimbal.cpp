@@ -21,7 +21,8 @@ Gimbal::Gimbal(const std::string & config_path, AfterSendGimbalData after_send_g
   auto yaml = tools::load(config_path);
   auto com_port = tools::read<std::string>(yaml, "com_port");
   control_guard_.configure(yaml["shoot_max_age_ms"].as<double>(100),
-                           yaml["control_max_age_ms"].as<double>(200));
+                           yaml["control_max_age_ms"].as<double>(200),
+                           yaml["camera_timing_calibrated"].as<bool>(false));
   use_packet_quaternion_ = yaml["gimbal_use_packet_quaternion"].as<bool>(false);
   send_latency_ = std::make_unique<tools::LatencyStats>(yaml["runtime_metrics"].as<bool>(false));
 
@@ -37,15 +38,7 @@ Gimbal::Gimbal(const std::string & config_path, AfterSendGimbalData after_send_g
   }
 
   publisher_ = std::make_unique<ControlPublisher>(
-    [this](ControlIntent intent) {
-      auto result = control_guard_.apply(intent, mode() != GimbalMode::IDLE);
-      const auto feedback = state();
-      if (!control_guard_.feedback_fresh(feedback.timestamp) ||
-          !std::isfinite(feedback.yaw) || !std::isfinite(feedback.pitch) ||
-          !std::isfinite(feedback.bullet_speed) || feedback.bullet_speed <= 0)
-        result.command.shoot = false;
-      return result;
-    },
+    [this](ControlIntent intent) { return control_guard_.apply(intent, mode() != GimbalMode::IDLE); },
     [this](const ControlIntent & intent) { write_control(intent); });
   thread_ = std::thread(&Gimbal::read_thread, this);
 
@@ -260,11 +253,15 @@ void Gimbal::read_thread()
       
       // Validate quaternion
       Eigen::Quaterniond packet_q(rx_pkt.q[0], rx_pkt.q[1], rx_pkt.q[2], rx_pkt.q[3]);
+      bool pose_feedback_valid = false;
       if (use_packet_quaternion_) {
-        if (packet_q.coeffs().allFinite() && std::abs(packet_q.squaredNorm() - 1) < 1e-2)
+        if (packet_q.coeffs().allFinite() && std::abs(packet_q.squaredNorm() - 1) < 1e-2) {
           pose_history_.push(packet_q, t);
+          pose_feedback_valid = true;
+        }
       } else if (std::abs(w * w + x * x + y * y + z * z - 1) < 1e-2) {
           pose_history_.push({w, x, y, z}, t);
+          pose_feedback_valid = true;
       } else {
           tools::logger()->warn("[CBoardUART] Invalid quaternion received");
       }
@@ -299,9 +296,13 @@ void Gimbal::read_thread()
             break;
         }
         if (mode_ != previous_mode) {
-          control_guard_.invalidate(t);
+          // Frames captured while this packet was arriving still belong to
+          // the previous mode. Use the mode-observation time as the boundary.
+          control_guard_.invalidate();
           publisher_->publish({});
         }
+        control_guard_.observe_feedback(t, pose_feedback_valid &&
+          std::isfinite(rx_pkt.yaw) && std::isfinite(rx_pkt.pitch), rx_pkt.bullet_speed);
 #ifndef NDEBUG
         nlohmann::json data;
         data["mode"] = str(mode_);
